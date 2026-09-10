@@ -17,7 +17,7 @@
             "id": "76e28921-5229-50bc-96e6-79c5abbb1c7d"
           },
           "host": {
-            "name": "steamdeck"
+            "name": "fixture-deck.example"
           },
           "rigsignal": {
             "diagnosis": {
@@ -57,7 +57,7 @@
             "id": "13610797-13f7-5c07-b028-4bd88c0b3edd"
           },
           "host": {
-            "name": "gamingpc"
+            "name": "fixture-peer.example"
           },
           "rigsignal": {
             "diagnosis": {
