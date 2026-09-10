@@ -14,7 +14,8 @@ IDENTITY_FIELDS = {
     tuple(field.split('.'))
     for field in (
         'host.name', 'host.hostname', 'host.id', 'host.ip', 'host.mac',
-        'agent.id', 'elastic_agent.id', 'rigsignal.session.id',
+        'agent.id', 'agent.name', 'agent.ephemeral_id', 'elastic_agent.id',
+        'rigsignal.session.id',
         'rigsignal.session.label', 'peer.name', 'peer.id',
     )
 }
