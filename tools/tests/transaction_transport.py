@@ -349,7 +349,11 @@ class ScriptedTransactionTransport:
         if self._on_mutation is not None:
             self._on_mutation(key)
 
-    def urlopen(self, request: Any) -> _Response:
+    # `timeout` is accepted and ignored: production passes
+    # install_assets.REQUEST_TIMEOUT_SECONDS, and this double performs no real
+    # I/O, so there is nothing to time out. Named explicitly rather than
+    # swallowed by **kwargs so a future signature change fails loudly here.
+    def urlopen(self, request: Any, timeout: float | None = None) -> _Response:
         parsed = urlsplit(request.full_url)
         query = {name: tuple(values) for name, values in parse_qs(parsed.query, keep_blank_values=True).items()}
         method, path = request.get_method(), parsed.path
