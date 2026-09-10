@@ -42,6 +42,8 @@ import asset_adapters
 ROOT = Path(__file__).resolve().parent.parent
 ASSET_DIR = ROOT / "elastic"
 DASHBOARD_DIR = ROOT / "dashboards" / "v0.3.1"
+# Stay well under the 60 s prerequisite poll bound so a stalled endpoint cannot outlive it.
+REQUEST_TIMEOUT_SECONDS = 30
 ASSET_TYPES = {
     "component-templates": "component_templates",
     "index-templates": "index_templates",
@@ -906,12 +908,14 @@ def request_response(base: str, path: str, method: str, authorization: str, data
     target = base.rstrip("/") + path
     req = urllib.request.Request(target, data=data, method=method, headers=request_headers)
     try:
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
         raise RequestFailure(error.code, f"HTTP {error.code}", error.read()) from error
     except urllib.error.URLError as error:
         raise RequestFailure(None, f"network error: {error.reason}") from error
+    except TimeoutError as error:
+        raise RequestFailure(None, f"network timeout after {REQUEST_TIMEOUT_SECONDS}s") from error
 
 
 def request(base: str, path: str, method: str, authorization: str, data: bytes | None = None,

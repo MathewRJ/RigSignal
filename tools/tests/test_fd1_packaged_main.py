@@ -91,10 +91,10 @@ def install_seam(frame):
     values = frame.f_globals
     bundle = values["load_bundle"](bundle_path)
     transport = ScriptedTransactionTransport(install, bundle)
-    def recorded_urlopen(request):
+    def recorded_urlopen(request, timeout=None):
         with audit.open("a", encoding="utf-8") as handle:
             handle.write(request.get_method() + " " + request.full_url + "\n")
-        return transport.urlopen(request)
+        return transport.urlopen(request, timeout)
     values["urllib"].request.urlopen = recorded_urlopen
     values["configure_https"] = lambda *_args: None
     # The checkout's fixed 0775 worktree ancestor is outside the disposable

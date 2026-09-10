@@ -1042,9 +1042,9 @@ def persist_mutation(key):
 fake = ScriptedTransactionTransport(install, bundle, scripts, on_mutation=persist_mutation,
                                     bundle_meta_timestamp="2026-08-04T12:34:56Z")
 real_urlopen = fake.urlopen
-def tracked_urlopen(request):
+def tracked_urlopen(request, timeout=None):
     try:
-        return real_urlopen(request)
+        return real_urlopen(request, timeout)
     finally:
         # Persist each completed HTTP observation before a subsequent crash
         # hook can kill this interpreter.  The parent decodes the target from
