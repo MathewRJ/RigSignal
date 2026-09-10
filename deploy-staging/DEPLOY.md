@@ -14,8 +14,13 @@ Post-validation live signature: 9/9 probes; `variant=legacy key_field=id key_off
 scope_field=entity scope_offset=8`; seven probes at 60 docs/min. On-box `.bak-*` files
 from the first round remain the rollback point (pair-restore together).
 
-Targets: **GamingPC** `deck@192.168.50.254` AND **StreamClient** `deck@192.168.50.162`.
+Targets: the two paired producer hosts, `<user>@<box-a>` AND `<user>@<box-b>`.
 Unlike the 0.2.3 deploy, BOTH pair files changed — never install one without the other.
+
+> **This section is stale.** It named two hosts by address, hostname and login user. Those addresses
+> stopped resolving when the LAN was renumbered in August 2026, so the line was misleading as well as
+> over-specific; the placeholders match the `deck@<box>` idiom already used below. Removing them here
+> **unpublishes nothing** — the values remain in this file's git history and in every existing clone.
 
 ## What this deploy changes at runtime
 
