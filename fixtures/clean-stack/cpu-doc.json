@@ -1,8 +1,8 @@
 {
   "agent": {
-    "ephemeral_id": "025bd3ea-57e0-4abf-a249-974cdb216b5c",
+    "ephemeral_id": "00000000-0000-4000-8000-000000000003",
     "id": "00000000-0000-4000-8000-000000000001",
-    "name": "StreamClient",
+    "name": "fixture-client.example",
     "type": "filebeat",
     "version": "9.4.3"
   },

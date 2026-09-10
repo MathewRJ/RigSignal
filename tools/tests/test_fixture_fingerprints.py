@@ -27,6 +27,8 @@ class FixtureFingerprintTests(unittest.TestCase):
             ('ipv6_local', 'host.ip', 'fd00::1', 'IP'),
             ('mac', 'host.mac', 'AA:BB:CC:DD:EE:FF', 'MAC'),
             ('uuid', 'agent.id', '123e4567-e89b-12d3-a456-426614174000', 'UUID'),
+            ('agent_ephemeral_id', 'agent.ephemeral_id', '123e4567-e89b-12d3-a456-426614174000', 'UUID'),
+            ('agent_name', 'agent.name', 'some-real-box', 'allowlist-only'),
             ('host_id', 'host.id', 'abcdef0123456789abcdef0123456789', 'host.id'),
             ('hostname', 'host.name', 'some-real-box', 'allowlist-only'),
             ('peer_id', 'peer.id', 99999999999999, 'allowlist-only'),
@@ -41,7 +43,7 @@ class FixtureFingerprintTests(unittest.TestCase):
         for name, field, value, category in cases:
             with self.subTest(name=name):
                 self.assertIn(f'tests/{name}.json: {field} = {value} ({category})', result.stdout)
-        self.assertIn('Scanned 9 files; found 9 violations.', result.stdout)
+        self.assertIn('Scanned 11 files; found 11 violations.', result.stdout)
 
     def test_allowed_fingerprints(self):
         allow = json.loads((ROOT / 'scripts/fixture-fingerprint-allowlist.json').read_text())['allow']
