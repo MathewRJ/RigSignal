@@ -1,0 +1,16 @@
+{
+  "allow": {
+    "fixture-local.example": "Documented synthetic EventContext constant Fixture-LOCAL.EXAMPLE, fixtures/diagnosis_event/v1/MANIFEST.md:49; RFC2606 reserved .example TLD",
+    "mixed-diagnostic.example": "Pre-existing synthetic diagnosis fixture hostname; RFC2606 reserved .example TLD",
+    "fixture-client.example": "Synthetic replacement minted 2026-09-10 for the captured StreamClient hostname; RFC2606",
+    "fixture-host.example": "Synthetic replacement minted 2026-09-10 for the captured rigsignal-matrix-host hostname; RFC2606",
+    "fixture-peer.example": "Synthetic replacement minted 2026-09-10 for the captured GamingPC/gamingpc host (one machine, two cases); RFC2606",
+    "fixture-deck.example": "Synthetic replacement minted 2026-09-10 for the captured steamdeck hostname; RFC2606",
+    "00000000-0000-4000-8000-000000000001": "Synthetic replacement minted 2026-09-10 for the captured agent.id/elastic_agent.id",
+    "00000000-0000-4000-8000-000000000002": "Synthetic replacement minted 2026-09-10 for the captured rigsignal.session.id",
+    "00000000000000000000000000000001": "Synthetic replacement minted 2026-09-10 for the captured host.id",
+    "1000000000000000001": "Synthetic replacement minted 2026-09-10 for the captured Steam peer.id",
+    "00-00-5E-00-53-01": "RFC7042 documentation MAC range",
+    "00-00-5E-00-53-02": "RFC7042 documentation MAC range"
+  }
+}

@@ -1,7 +1,7 @@
 {
   "agent": {
     "ephemeral_id": "025bd3ea-57e0-4abf-a249-974cdb216b5c",
-    "id": "458b3674-1eff-4127-a762-59c140aaa9b8",
+    "id": "00000000-0000-4000-8000-000000000001",
     "name": "StreamClient",
     "type": "filebeat",
     "version": "9.4.3"
@@ -13,7 +13,7 @@
   },
   "ecs": {"version": "8.0.0"},
   "elastic_agent": {
-    "id": "458b3674-1eff-4127-a762-59c140aaa9b8",
+    "id": "00000000-0000-4000-8000-000000000001",
     "snapshot": false,
     "version": "9.4.3"
   },
@@ -21,17 +21,17 @@
   "host": {
     "architecture": "x86_64",
     "containerized": false,
-    "hostname": "StreamClient",
-    "id": "ca828d4f1efb4cdc91a01b4c228479d6",
-    "ip": ["192.168.50.162", "fe80::50c4:b556:fde4:185a"],
-    "mac": ["50-FE-0C-31-1A-CC", "B0-82-E2-02-95-1B"],
-    "name": "rigsignal-matrix-host",
+    "hostname": "fixture-client.example",
+    "id": "00000000000000000000000000000001",
+    "ip": ["192.0.2.10", "2001:db8::10"],
+    "mac": ["00-00-5E-00-53-01", "00-00-5E-00-53-02"],
+    "name": "fixture-host.example",
     "os": {"build": "20260716.2", "codename": "holo", "family": "arch", "kernel": "6.16.12-drmexec7-valve24.5-1-neptune-616-drm-exec-gf253f5da553e", "name": "SteamOS", "platform": "steamos", "type": "linux", "version": "3.8.24"}
   },
   "input": {"type": "filestream"},
   "log": {"file": {"device_id": "66312", "fingerprint": "e8888cc7ac0c795595943bbe737e86a764940e317bdf8d782ccacdb5412e53e8", "inode": "2773193", "path": "/home/deck/.local/state/rigsignal/spool/rigsignal-cpu.ndjson"}, "offset": 10037},
   "rigsignal": {
     "cpu": {"boost_state": true, "clock_mhz_avg": 1893, "governor": "powersave", "per_core": [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 6.9, 33.3], "temperature_c": 47.3, "total_utilisation_pct": 42.25},
-    "session": {"agent_version": "0.3.0", "id": "1dba15bd-ce4e-40e5-b920-5d9fa1066163", "label": "StreamClient", "label_source": "manual", "opt_in_public": false}
+    "session": {"agent_version": "0.3.0", "id": "00000000-0000-4000-8000-000000000002", "label": "fixture-client.example", "label_source": "manual", "opt_in_public": false}
   }
 }

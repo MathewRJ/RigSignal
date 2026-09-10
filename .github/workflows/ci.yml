@@ -248,6 +248,14 @@ jobs:
           done
           exit $fail
 
+  fixture-hygiene:
+    name: fixture-hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check fixtures for host fingerprints
+        run: python3 scripts/check-fixture-fingerprints.py
+
   # Single aggregate check for branch protection to require. Deliberately an
   # ALLOWLIST ("every result must be exactly success"), not a denylist of
   # failure/cancelled -- the deleted pr-gate job denylisted, so a `skipped`
@@ -269,11 +277,12 @@ jobs:
       - fmt
       - smoke-test
       - dashboard-hygiene
+      - fixture-hygiene
     steps:
       - name: Verify every required job succeeded
         env:
           RESULTS: ${{ join(needs.*.result, ',') }}
-          EXPECTED: "8"
+          EXPECTED: "9"
         run: |
           set -euo pipefail
           echo "upstream results: ${RESULTS}"

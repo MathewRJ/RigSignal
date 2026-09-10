@@ -174,7 +174,7 @@ cpu_sentinel_fetch() {
   # so all assert output is routed to stderr; only the hash reaches stdout.
   local name="$1" out="$2" hits
   request "$name" "$out" --header 'Content-Type: application/json' --request POST \
-    --data '{"query":{"term":{"host.name":"rigsignal-matrix-host"}},"size":2}' \
+    --data '{"query":{"term":{"host.name":"fixture-host.example"}},"size":2}' \
     "$ES_URL/$CPU_INDEX/_search" 1>&2
   hits="$(jq -r '.hits.total.value' "$out")"
   assert_equal "$name-unique-sentinel" "1" "$hits" 1>&2
@@ -211,8 +211,8 @@ esql() {
 }
 asserts() {
   local title actual component pipeline
-  esql cpu-marker "FROM $CPU_INDEX | WHERE host.name == \"rigsignal-matrix-host\" | KEEP rigsignal.cpu.total_utilisation_pct" 42.25
-  esql events-value "FROM $EVENTS_INDEX | WHERE host.name == \"rigsignal-matrix-host\" | KEEP rigsignal.stream.client.event" connected
+  esql cpu-marker "FROM $CPU_INDEX | WHERE host.name == \"fixture-host.example\" | KEEP rigsignal.cpu.total_utilisation_pct" 42.25
+  esql events-value "FROM $EVENTS_INDEX | WHERE host.name == \"fixture-host.example\" | KEEP rigsignal.stream.client.event" connected
   kb_request dashboard-find-rigsignal "$RUN_DIR/dashboards-rigsignal.json" --request GET "$KB_URL/s/rigsignal/api/saved_objects/_find?type=dashboard&per_page=1000"; actual="$(jq -r .total "$RUN_DIR/dashboards-rigsignal.json")"; assert_equal dashboard-rigsignal-total 6 "$actual"
   kb_request dashboard-find-default "$RUN_DIR/dashboards.json" --request GET "$KB_URL/api/saved_objects/_find?type=dashboard&per_page=1000"; actual="$(jq -r .total "$RUN_DIR/dashboards.json")"; assert_equal dashboard-default-total 1 "$actual"; jq -s '{saved_objects: (map(.saved_objects) | add)}' "$RUN_DIR/dashboards-rigsignal.json" "$RUN_DIR/dashboards.json" >"$RUN_DIR/dashboards-all.json"; mv "$RUN_DIR/dashboards-all.json" "$RUN_DIR/dashboards.json"
   for title in 'RigSignal: Engine & Diagnostics' 'RigSignal Flamegraph Profiles' 'RigSignal: Game Performance' 'RigSignal: Overview' 'RigSignal: Software Stack' 'RigSignal Streaming Lab' 'RigSignal: System Health'; do actual="$(jq -r --arg title "$title" '[.saved_objects[]|select(.attributes.title==$title)]|length' "$RUN_DIR/dashboards.json")"; assert_equal "dashboard-title-$title" 1 "$actual"; done
