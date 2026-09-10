@@ -12,9 +12,23 @@ on:
     - cron: '0 9 * * 1'
   workflow_dispatch:
 
+# Push runs are grouped by COMMIT, not by ref, so no push can contend with
+# another.  Grouping every main push together lost gate conclusions two ways:
+# cancel-in-progress cancelled the running one, and GitHub keeps only a single
+# pending run per group, so a third arrival cancelled the queued one as well.
+# On 2026-09-10 three merges landed within 17 seconds and neither non-final
+# merge commit got a usable conclusion, in two different ways: 1836839e's run
+# was cancelled but its ci-gate job still completed as FAILURE, because 7 of
+# its 9 needs were cancelled and the gate rejects any non-success result -- a
+# false red now permanent in main's history, on a commit whose own pre-merge
+# run was green.  9dce7563's run was cancelled before any job started, leaving
+# no conclusion at all.  A burst on main does not merely lose conclusions, it
+# manufactures them.  Every other event keeps ref-grouping with cancellation,
+# which is what makes a superseded PR push stop burning a runner.
+# release.yml:29 takes the same no-cancel position for tags.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
