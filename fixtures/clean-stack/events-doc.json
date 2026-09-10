@@ -1,6 +1,6 @@
 {
   "data_stream": {"dataset": "rigsignal.events", "namespace": "default", "type": "logs"},
   "event": {"agent_id_status": "missing", "category": ["network"], "kind": "event", "type": ["connection", "start"]},
-  "host": {"hostname": "ci-negative-control", "name": "fixture-host.example"},
+  "host": {"name": "fixture-host.example"},
   "rigsignal": {"stream": {"client": {"event": "connected", "peer": {"id": "1000000000000000001", "name": "fixture-peer.example"}, "transport": "direct"}}}
 }
