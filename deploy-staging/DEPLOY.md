@@ -48,9 +48,9 @@ sudo journalctl -u rigsignal-ebpf --since -2min --no-pager | grep -Ei 'gpu_sched
 ## Live acceptance (A9.2-R — orchestrator-coordinated after install)
 
 1. Journal shows `variant=legacy key_field=id key_offset=32` + 9/9 probes (both boxes).
-2. Orchestrator launches a game remotely on GamingPC; `gpu_sched` docs appear in
+2. Orchestrator launches a game remotely on the gaming host; `gpu_sched` docs appear in
    `metrics-rigsignal.ebpf-default`.
-3. Reference comparison (GamingPC, mid-game, USER-run):
+3. Reference comparison (the gaming host, mid-game, USER-run):
    `sudo /tmp/rigsignal-gpusched/gpu-sched-ftrace-reference.sh 60 /tmp/gpu-sched-ref.txt`
    — orchestrator fetches the capture, runs `gpu-sched-reference-parse.py`, and compares
    count + latency distribution against the daemon's docs for the same window within

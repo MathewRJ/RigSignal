@@ -7,7 +7,7 @@ Write `tasks/rigsignal-0.2.4-gpu-sched-loss.RESULT.md` in the worktree.
 
 > Before starting: `CHRONO_SESSION=2026-07-17-024-kickoff bash /home/dev/coding/Workflow/scripts/stm.sh recall --all-sessions --last 30`. Save findings via stm.sh (STM_AGENT=codex-impl@dev); if curl is blocked, put them in the RESULT. Return a condensed summary.
 
-## Live evidence (valve 6.16 GamingPC, HFW session d26bc3b0, 2026-07-17 19:50–20:01Z)
+## Live evidence (the gaming host running valve 6.16, HFW session 00000000-0000-4000-8000-000000000002, 2026-07-17 19:50–20:01Z)
 
 1. Port deployed; journal shows `variant="legacy" key_field="id" key_offset=32`, 9/9 probes.
 2. **Kernel ground truth** (root ftrace capture 19:53:42–19:54:42, parsed by

@@ -15,7 +15,7 @@ the conflict in your summary.
 
 ## S2 — Spool shutdown finalization + startup recovery + retention  (RELEASE BLOCKER)
 
-### Negative control (run live 2026-07-18, .162 — evidence banked)
+### Negative control (run live 2026-07-18, the streaming client — evidence banked)
 
 Pre-stop: 24 buffered records across 7 dataset `.tmp` files (cpu 6; audio/gpu/memory/
 network/power/storage 3 each). Graceful `systemctl --user stop rigsignal-agent`: `.tmp`
@@ -28,7 +28,7 @@ stale-age rotation fired coincidentally at write time (`shipper.rs:81`, rotation
 runs per write). Escape by timing luck, not design.
 
 **Related debt folded in (found 2026-07-18):** shipped finals are never deleted — live:
-.162 = 406 MB / 39,966 files (since 07-14), .254 = 406 MB / 3,190 files (since 07-16).
+the streaming client = 406 MB / 39,966 files (since 07-14), the gaming host = 406 MB / 3,190 files (since 07-16).
 Unbounded growth; 40k files in one directory also taxes filestream scans.
 
 ### Decisions (spec-time; spar verdicts applied)
@@ -98,13 +98,13 @@ Unbounded growth; 40k files in one directory also taxes filestream scans.
 - A4 Rotation regression: existing stale-age test passes unchanged; ADD a size-rotation
   test (none exists today — `shipper.rs:623-650` covers stale only); forced-stale-at-
   summary shutdown test.
-- A5 End-to-end Fleet (live, .162): repeat the negative-control choreography post-deploy —
+- A5 End-to-end Fleet (live, the streaming client): repeat the negative-control choreography post-deploy —
   assert a ZERO-gap ES timeline across the restart AND no duplicate docs (logs datasets
   checked by count, TSDS by absence of conflict storms); pin the deployed Agent version in
   the attestation. Fleet re-read of a recovered file is tolerated per D2 (at-least-once)
   but must be OBSERVED and recorded if it occurs.
 - A6 Retention: finals + quarantine older than the configured window are pruned at
-  rotation; newer files untouched; live disk usage on .162 drops from ~406 MB and stays
+  rotation; newer files untouched; live disk usage on the streaming client drops from ~406 MB and stays
   bounded over 24h.
 - A7 Lock: second agent instance against the same spool dir fails fast with the
   documented error.

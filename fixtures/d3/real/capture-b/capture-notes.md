@@ -2,24 +2,24 @@
 
 **Capture timestamp (UTC):** 2026-07-21T17:40:48Z (system local time CEST = UTC+2)
 **Box:** `USER-REDACTED@IP-REDACTED`, label `capture-b`
-**Identity:** hostname `HOST-REDACTED-B`, current boot_id `a4bb45300c884eefb429ce06d3145b2a`
+**Identity:** hostname `HOST-REDACTED-B`, current boot index `0`
 **Kernel (current boot):** `6.16.12-drmexec7-valve24.5-1-neptune-616-drm-exec-gf253f5da553e`
 **dGPU present:** `0000:09:00.0`, vendor `0x1002` device `0x7590` (Navi 44 / Radeon RX 9060 XT), class `0x030000` — this box is single-boot (no multi-boot caveat needed).
 
-## journalctl --list-boots (full output)
+## journalctl --list-boots (boot IDs omitted for publication)
 
 ```
-IDX BOOT ID                          FIRST ENTRY                  LAST ENTRY
- -9 593f229c7860468bb75c07a9e88aef93 Thu 2026-07-16 23:08:52 CEST Thu 2026-07-16 23:08:53 CEST
- -8 2ee0e394ec8d4cfe81923e2177faf5e5 Fri 2026-07-17 09:06:49 CEST Fri 2026-07-17 18:19:19 CEST
- -7 b6cf51a05981499fa28bb431597d320c Fri 2026-07-17 20:13:55 CEST Fri 2026-07-17 23:48:55 CEST
- -6 3d1395c887e841979a71e00e00b9c781 Sat 2026-07-18 08:04:35 CEST Mon 2026-07-20 10:01:48 CEST
- -5 2869a7bfc8bd45fb94bbad9d2fdf062e Mon 2026-07-20 10:02:39 CEST Mon 2026-07-20 17:29:54 CEST
- -4 37a648f4e6fe4759a25f1e7a99b7df49 Mon 2026-07-20 17:30:10 CEST Mon 2026-07-20 19:41:23 CEST
- -3 ef2f803516ad4eb28f12c58e678c2471 Mon 2026-07-20 19:41:36 CEST Mon 2026-07-20 23:01:49 CEST
- -2 c71ee74c7ba741da835ab2999b325cd0 Tue 2026-07-21 08:49:10 CEST Tue 2026-07-21 10:56:57 CEST
- -1 cf2784b0e975431eb0d7d2ab5fe0c6b4 Tue 2026-07-21 10:57:10 CEST Tue 2026-07-21 12:27:37 CEST
-  0 a4bb45300c884eefb429ce06d3145b2a Tue 2026-07-21 12:27:50 CEST Tue 2026-07-21 19:39:13 CEST (ongoing at capture time)
+IDX FIRST ENTRY                  LAST ENTRY
+ -9 Thu 2026-07-16 23:08:52 CEST Thu 2026-07-16 23:08:53 CEST
+ -8 Fri 2026-07-17 09:06:49 CEST Fri 2026-07-17 18:19:19 CEST
+ -7 Fri 2026-07-17 20:13:55 CEST Fri 2026-07-17 23:48:55 CEST
+ -6 Sat 2026-07-18 08:04:35 CEST Mon 2026-07-20 10:01:48 CEST
+ -5 Mon 2026-07-20 10:02:39 CEST Mon 2026-07-20 17:29:54 CEST
+ -4 Mon 2026-07-20 17:30:10 CEST Mon 2026-07-20 19:41:23 CEST
+ -3 Mon 2026-07-20 19:41:36 CEST Mon 2026-07-20 23:01:49 CEST
+ -2 Tue 2026-07-21 08:49:10 CEST Tue 2026-07-21 10:56:57 CEST
+ -1 Tue 2026-07-21 10:57:10 CEST Tue 2026-07-21 12:27:37 CEST
+  0 Tue 2026-07-21 12:27:50 CEST Tue 2026-07-21 19:39:13 CEST (ongoing at capture time)
 ```
 
 This box retains far more history (10 boots back to 2026-07-16) than capture-a (4 boots). Only boots -1, -2, -3 were captured per spec; boots -4 through -9 exist but were intentionally NOT captured (out of scope).

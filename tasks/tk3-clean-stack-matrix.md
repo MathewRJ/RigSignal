@@ -28,7 +28,7 @@ fixtures from.
    - `--keep` and `--dry-run` behave as in spike.sh.
 2. **Fixtures `fixtures/clean-stack/{cpu-doc.json,events-doc.json}`** derived from the
    samples: keep real structure/dimensions, normalize `host.name` to lowercase
-   `rigsignal-matrix-host` (both docs), set an obvious marker value in one numeric field
+   `fixture-host.example` (both docs), set an obvious marker value in one numeric field
    you then assert exactly (document which). `@timestamp` must be set AT INGEST TIME by
    the script (TSDS accept window — a stale timestamp will be rejected); script injects
    `"@timestamp"` via jq before POST.
@@ -43,7 +43,7 @@ fixtures from.
    install-current-twice). Install it with a small `install-previous-state.sh` (plain curl
    loop is fine here — failures must abort, no silent skips).
 4. **Asserts** (in matrix.sh, via ES|QL `/_query`):
-   - cpu doc: `FROM metrics-rigsignal.cpu-default | WHERE host.name == "rigsignal-matrix-host"`
+   - cpu doc: `FROM metrics-rigsignal.cpu-default | WHERE host.name == "fixture-host.example"`
      returns exactly 1 row with the exact marker value.
    - events doc: analogous.
    - dashboards: saved-objects find by type=dashboard returns exactly the canonical count

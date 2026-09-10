@@ -40,7 +40,7 @@ Add `--json` for one JSON document, or `--host NAME` to attach the host name to
 a diagnosis:
 
 ```bash
-rigsignal-agent diagnose display --json --host gamingpc
+rigsignal-agent diagnose display --json --host fixture-peer.example
 ```
 
 In offline mode, `--modes-cfg` and `--drm-state` are a pair. Supplying only one
@@ -54,7 +54,7 @@ is incomplete; the command does not combine one supplied file with live state.
 
 ## Real replay example
 
-This is the seeded degraded run from the verified GamingPC (.254) live replay.
+This is the seeded degraded run from the verified live replay on the gaming host.
 The configuration was restored afterwards and its SHA-256 matched the original.
 
 ```text

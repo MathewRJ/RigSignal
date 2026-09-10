@@ -1,6 +1,6 @@
 {
   "captured": "2026-07-01T18:15:17+02:00",
-  "source": "real:.26 base capture + SYNTHETIC mutation (active_mode field only)",
+  "source": "real:fixture-deck.example base capture + SYNTHETIC mutation (active_mode field only)",
   "connectors": [
     {
       "name": "card0-DP-1",
@@ -9,7 +9,7 @@
       "dpms": "On",
       "edid_bytes": 256,
       "active_mode": "1280x800@60",
-      "active_mode_note": "SYNTHETIC field -- this is the only mutated value in this file. Real value from the same-connector good capture (d6/deck-real/drm-state.json) was 3840x2160@120. Everything else below (status/enabled/dpms/edid_bytes/modes list) is verbatim from the real .26 capture, since the panel's advertised capabilities did not change between the corrupt and fixed states -- only the modes.cfg pin (and hence the active mode) differed. Corroborated by real file d6/deck-incident-bad/modes.cfg, which is the genuine pre-fix ~/.config/gamescope/modes.cfg.bak.1782922517 recovered from .26 (timestamp 2026-07-01T18:15:17+02:00, ~88s before the fix logged in mem-1782922605).",
+      "active_mode_note": "SYNTHETIC field -- this is the only mutated value in this file. Real value from the same-connector good capture (d6/deck-real/drm-state.json) was 3840x2160@120. Everything else below (status/enabled/dpms/edid_bytes/modes list) is verbatim from the real fixture-deck.example capture, since the panel's advertised capabilities did not change between the corrupt and fixed states -- only the modes.cfg pin (and hence the active mode) differed. Corroborated by real file d6/deck-incident-bad/modes.cfg, which is the genuine pre-fix ~/.config/gamescope/modes.cfg.bak.1782922517 recovered from fixture-deck.example (timestamp 2026-07-01T18:15:17+02:00, ~88s before the fix logged in mem-1782922605).",
       "modes": [
         "3840x2160", "4096x2160", "4096x2160", "4096x2160", "4096x2160", "4096x2160",
         "4096x2160", "4096x2160", "4096x2160", "4096x2160", "4096x2160",

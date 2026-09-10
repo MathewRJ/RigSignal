@@ -1,6 +1,6 @@
 # gpu_sched legacy port — A9.2-R live validation evidence (2026-07-17, session 2026-07-17-024-kickoff)
 
-Box: GamingPC deck@192.168.50.254, kernel 6.16.12-drmexec7-valve, HFW (appid 2420110)
+Box: the gaming host deck@192.0.2.254, kernel 6.16.12-drmexec7-valve, HFW (appid 2420110)
 running. Deployed pair: daemon `9e5f3bec…`, probes `ddf8199e…` (main `c7288e5`).
 Attach log: `variant="legacy" key_field="id" key_offset=32 scope_field="entity"
 scope_offset=8`, 9/9 probes, both boxes.
