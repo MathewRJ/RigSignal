@@ -6,6 +6,7 @@ repo=$(cd "$repo_dir"; pwd)
 launcher="$repo/packaging/rigsignal-launcher.sh"
 corpus="$repo/packaging/tests/sidecar-verifier-corpus.tsv"
 python3 "$repo/packaging/tests/test-assets-signal-boundary.py" "$launcher"
+python3 "$repo/packaging/tests/test-assets-spawn-window.py" "$launcher"
 python3 "$repo/packaging/tests/test-assets-signal-driver.py" "$repo/packaging/tests/assets-signal-driver.py"
 python3 "$repo/packaging/tests/test-assets-signal-reporting.py" "$repo/packaging/tests/assets-signal-driver.py"
 tmp=$(mktemp -d)
