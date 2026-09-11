@@ -33,25 +33,31 @@ def worker(driver, case):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if case in ('expired-cleanup', 'partial-cleanup'):
-        descendants = []
+        children, groups, descendants = [], [], []
         with tempfile.TemporaryDirectory() as directory:
-            if case == 'expired-cleanup':
-                # A launcher in its own session with its own child, because the
-                # single-sleep shape admitted termination of the known PID while
-                # an undiscovered descendant survived. start_new_session mirrors
-                # run(), so the launcher leads the group the harness created.
-                marker = Path(directory) / 'descendant'
-                children = [subprocess.Popen(
-                    ['sh', '-c', 'sleep 100 & echo "$!" > "$1"; wait', 'sh', str(marker)],
-                    start_new_session=True)]
-                limit = time.monotonic() + 0.1
-                while not marker.exists() and time.monotonic() < limit:
-                    time.sleep(0.001)
-                assert marker.exists(), 'fixture did not start its descendant'
-                descendants.append(int(marker.read_text()))
-            else:
-                children = [subprocess.Popen(['sleep', '100']) for _ in range(2)]
+            # Rescue opens BEFORE the fixture exists. Creation, the startup wait
+            # and the marker parse are all inside it, because a fixture that
+            # started and never published its marker leaves a descendant this
+            # scope cannot name -- and an assertion raised above the try left
+            # that fixture running.
             try:
+                if case == 'expired-cleanup':
+                    # A launcher in its own session with its own child, because the
+                    # single-sleep shape admitted termination of the known PID while
+                    # an undiscovered descendant survived. start_new_session mirrors
+                    # run(), so the launcher leads the group the harness created.
+                    marker = Path(directory) / 'descendant'
+                    children.append(subprocess.Popen(
+                        ['sh', '-c', 'sleep 100 & echo "$!" > "$1"; wait', 'sh', str(marker)],
+                        start_new_session=True))
+                    groups.append(children[-1].pid)
+                    limit = time.monotonic() + 0.1
+                    while not marker.exists() and time.monotonic() < limit:
+                        time.sleep(0.001)
+                    assert marker.exists(), 'fixture did not start its descendant'
+                    descendants.append(int(marker.read_text()))
+                else:
+                    children.extend(subprocess.Popen(['sleep', '100']) for _ in range(2))
                 deadline = time.monotonic() + 0.05
                 with contextlib.ExitStack() as stack:
                     if case == 'expired-cleanup':
@@ -90,6 +96,14 @@ def worker(driver, case):
             finally:
                 for child in children:
                     if child.poll() is None:
+                        # Only groups this worker created as session leaders, and
+                        # only while the leader lives, so a reaped pid is never
+                        # signalled as somebody else's group.
+                        if child.pid in groups:
+                            try:
+                                os.killpg(child.pid, signal.SIGKILL)
+                            except OSError:
+                                pass
                         child.kill()
                     child.wait()
                 for pid in descendants:
