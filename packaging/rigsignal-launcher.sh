@@ -593,8 +593,17 @@ PYEOF
     else
         [ -n "${ASSETS_ENGINE_STATUS+x}" ] || ASSETS_ENGINE_STATUS=$_assets_signal_status
     fi
-    assets_cleanup "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
-    trap - EXIT HUP INT TERM
+    # Retire the EXIT trap BEFORE teardown, and handle cleanup's return
+    # deliberately.  assets_cleanup returns the status it was given and resets
+    # ASSETS_CLEANING on the way out, so with errexit enabled above a nonzero
+    # engine status ended the shell on this very line -- before the trap was
+    # removed -- and the still-installed EXIT trap ran cleanup a second time.
+    # HUP/INT/TERM stay ignored (set at the top of this handler) across the
+    # teardown, so a second signal during cleanup still cannot strand the
+    # one-shot credential; they are retired only once teardown is complete.
+    trap - EXIT
+    assets_cleanup "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}" || true
+    trap - HUP INT TERM
     exit "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
 }
 
