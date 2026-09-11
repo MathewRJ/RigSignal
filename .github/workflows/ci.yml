@@ -154,7 +154,14 @@ jobs:
       - name: Cache cargo registry + build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
-          workspaces: src -> target
+          # The workspace is the ROOT Cargo.toml (members = ["src"]), so Cargo's
+          # shared build directory is the root `target` -- which is also what the
+          # binary upload and the smoke test read from.  `src -> target` joined to
+          # `src/target`, a directory Cargo never builds into, and looked for a
+          # lockfile under src/ that does not exist (Cargo.lock is at the root).
+          # A cache restore REPORTS SUCCESS when it restores an empty directory,
+          # so this was green for as long as it was wrong.
+          workspaces: . -> target
           key: ${{ matrix.os }}
 
       - name: cargo check
@@ -217,7 +224,14 @@ jobs:
       - name: Cache cargo registry + build artifacts
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
-          workspaces: src -> target
+          # The workspace is the ROOT Cargo.toml (members = ["src"]), so Cargo's
+          # shared build directory is the root `target` -- which is also what the
+          # binary upload and the smoke test read from.  `src -> target` joined to
+          # `src/target`, a directory Cargo never builds into, and looked for a
+          # lockfile under src/ that does not exist (Cargo.lock is at the root).
+          # A cache restore REPORTS SUCCESS when it restores an empty directory,
+          # so this was green for as long as it was wrong.
+          workspaces: . -> target
           key: ubuntu-smoke
 
       - name: Build agent (debug)
