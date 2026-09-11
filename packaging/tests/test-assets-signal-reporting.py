@@ -15,6 +15,47 @@ import tempfile
 from unittest.mock import patch
 
 
+def rescue(module, children):
+    """Kill and reap everything this worker started, without needing a marker.
+
+    The worker is a subreaper (module.preflight sets it), so once a launcher dies
+    every descendant it orphans -- including one that setsid()'d away, since
+    setsid does not change the parent -- is reparented HERE and appears in this
+    process's own /proc children. That is the thing a fixture cannot fail to
+    publish: it does not have to publish anything. Keying rescue on a marker file
+    lost an unpublished descendant twice in this file's history.
+    """
+    for child in children:
+        if child.poll() is None:
+            try:
+                os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        child.wait()
+    limit = time.monotonic() + 0.05
+    while True:
+        try:
+            adopted = {int(value) for value
+                       in Path(f'/proc/self/task/{os.getpid()}/children').read_text().split()}
+        except OSError:
+            adopted = set()
+        for pid in adopted:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        while True:  # waitpid after every kill, never only at the end
+            try:
+                reaped, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                reaped = 0
+            if not reaped:
+                break
+        if not adopted or time.monotonic() >= limit:
+            return
+        time.sleep(0.001)
+
+
 def alive(pid):
     """Liveness from /proc/<pid>/stat, never from an exception class.
 
@@ -34,7 +75,8 @@ def worker(driver, case):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if case in ('expired-cleanup', 'partial-cleanup'):
-        children, groups, descendants = [], [], []
+        assert module.preflight(), 'containment prerequisites unavailable'
+        children, anchors, descendants = [], [], []
         with tempfile.TemporaryDirectory() as directory:
             # Rescue opens BEFORE the fixture exists. Creation, the startup wait
             # and the marker parse are all inside it, because a fixture that
@@ -51,7 +93,7 @@ def worker(driver, case):
                     children.append(subprocess.Popen(
                         ['sh', '-c', 'sleep 100 & echo "$!" > "$1"; wait', 'sh', str(marker)],
                         start_new_session=True))
-                    groups.append(children[-1].pid)
+                    anchors.append(os.pidfd_open(children[-1].pid))
                     limit = time.monotonic() + 0.1
                     while not marker.exists() and time.monotonic() < limit:
                         time.sleep(0.001)
@@ -76,7 +118,12 @@ def worker(driver, case):
                             return read(path, bound, *args)
                         stack.enter_context(patch.object(module, 'bounded_read', side_effect=incomplete))
                     try:
-                        module.cleanup(children[0], deadline)
+                        # The anchor is not optional: terminate_group refuses to
+                        # signal a bare number, so a caller without one gets no
+                        # containment at all. Supplying it here is the same
+                        # contract run() honours.
+                        module.cleanup(children[0], deadline,
+                                       anchor=anchors[0] if anchors else None)
                     except module.DiagnosticIncomplete:
                         pass
                 # Allow the kernel to deliver kills; the assertion is liveness.
@@ -95,70 +142,78 @@ def worker(driver, case):
                              if alive(pid)]
                 assert not survivors, f'SURVIVING PROCESSES: {survivors}'
             finally:
-                for child in children:
-                    if child.poll() is None:
-                        # Only groups this worker created as session leaders, and
-                        # only while the leader lives, so a reaped pid is never
-                        # signalled as somebody else's group.
-                        if child.pid in groups:
-                            try:
-                                os.killpg(child.pid, signal.SIGKILL)
-                            except OSError:
-                                pass
-                        child.kill()
-                    child.wait()
-                for pid in descendants:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                rescue(module, children)
+                for fd in anchors:
+                    os.close(fd)
         return
-    if case == 'pidfd-anchor':
-        # The identity anchor, asserted at the strength the evidence supports.
-        # Forced PID reuse is NOT reproduced here: the round-5 review tried and
-        # `unshare --user --map-root-user --pid --fork` was denied, so what is
-        # checked is that the anchor opens on the launcher, never re-points at a
-        # different identity across the reap, and that the reaped leader's group
-        # id answers ESRCH rather than reaching anything.
-        output = io.StringIO()
-        with patch.object(module.os, 'pidfd_open', side_effect=OSError(errno.ENOSYS, 'unavailable')), \
-                contextlib.redirect_stderr(output):
-            refused = module.preflight()
-        assert refused is False, 'preflight accepted a host without an identity anchor'
-        assert 'HARNESS SETUP: pidfd prerequisite' in output.getvalue(), output.getvalue()
-
-        child = subprocess.Popen(['sh', '-c', 'exit 7'], start_new_session=True)
-        pid = child.pid
-        fd = os.pidfd_open(pid)
-        def anchored():
-            for line in Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines():
-                if line.startswith('Pid:'):
-                    return int(line.split(':', 1)[1])
-            raise AssertionError('pidfd fdinfo carries no Pid field')
-        try:
-            assert anchored() == pid, 'anchor did not open on the launcher'
-            assert child.wait(timeout=0.1) == 7
-            # A recycled number would show a LIVE pid here. -1 is the kernel
-            # saying this identity is spent, which is the property relied on.
-            assert anchored() == -1, f'anchor followed another identity: {anchored()}'
+    if case == 'anchor-identity':
+        # BOUND TO run(), which is the whole point. The case it replaced built
+        # its own shell and its own pidfd, never called run(), and PASSED with
+        # run()'s anchor line deleted -- a false-negative oracle found by the
+        # round-6 review, not by its author.
+        #
+        # What is asserted: the group signal leaves through the DESCRIPTOR, and
+        # os.killpg is never reached. Swap terminate_group back to a numeric
+        # killpg and this case fails on the recorded call alone.
+        #
+        # What is NOT asserted, stated rather than omitted: that a recycled
+        # number is not signalled. Demonstrating that needs the round-6 forcing
+        # construction -- 4,194,004 serial children over 184 s to wrap the
+        # allocator -- which does not fit a 0.3 s worker, and no shortcut to it
+        # is honest. The substitute is this mechanism assertion plus the fact,
+        # constructed on the runner, that the kernel accepts the group flag.
+        assert module.preflight(), 'containment prerequisites unavailable'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for key in ('LAUNCHER', 'TEST_SCRIPT', 'FIXTURE', 'SIGNAL_READY', 'SIGNAL_SEEN',
+                        'SIGNAL_RESULT', 'SIGNAL_OUT', 'BUNDLE', 'CA', 'CREDENTIALS'):
+                os.environ['RIGSIGNAL_ASSETS_' + key] = str(root / key)
+            for key in ('TEST_SCRIPT', 'FIXTURE'):
+                Path(os.environ['RIGSIGNAL_ASSETS_' + key]).touch()
+            os.environ['RIGSIGNAL_LAUNCHER_WAIT_SECS'] = '0.05'
+            os.environ.pop('RIGSIGNAL_ASSETS_HARNESS_FAILURE', None)
+            os.environ.pop('RIGSIGNAL_ASSETS_REPEAT_SIGNAL', None)
+            launcher = Path(os.environ['RIGSIGNAL_ASSETS_LAUNCHER'])
+            launcher.write_text('#!/bin/sh\ntrap "" INT\nsleep 100 &\n'
+                                'echo "$!" > "' + str(root / 'engine') + '"\nwait\n')
+            launcher.chmod(0o700)
+            signals, group_calls = [], []
+            real = module.pidfd_group_signal
+            children = []
+            popen = module.subprocess.Popen
+            def record_group(anchor, number):
+                group_calls.append(number)
+                return real(anchor, number)
+            def launch(*args, **kwargs):
+                child = popen(*args, **kwargs)
+                children.append(child)
+                return child
             try:
-                os.killpg(pid, 0)
-            except ProcessLookupError:
-                pass
-            else:
-                raise AssertionError('something holds the reaped leader group id')
-        finally:
-            os.close(fd)
-            if child.poll() is None:
-                child.kill()
-                child.wait()
-        print(f'PASS: anchor pinned {pid} across the reap; group id answers ESRCH')
+                with patch.object(module, 'pidfd_group_signal', side_effect=record_group), \
+                        patch.object(module.os, 'killpg',
+                                     side_effect=lambda *a: signals.append(a)), \
+                        patch.object(module.subprocess, 'Popen', side_effect=launch), \
+                        patch.object(module.sys, 'argv', ['driver', 'INT']):
+                    code = module.main()
+                assert code == 1, code
+                assert signals == [], f'numeric killpg was reached: {signals}'
+                assert signal.SIGKILL in group_calls, (
+                    f'no identity-based group kill was issued: {group_calls}')
+                engine = root / 'engine'
+                assert engine.exists(), 'fixture did not start its engine'
+                survivors = [pid for pid in [child.pid for child in children]
+                             + [int(engine.read_text())] if alive(pid)]
+                assert not survivors, f'SURVIVING PROCESSES: {survivors}'
+            finally:
+                rescue(module, children)
+        print('PASS: run() signalled the group through the descriptor; killpg unreached')
         return
     if case == 'detached-expiry':
         # The NAMED RESIDUAL, tested rather than described. A descendant that
         # setsid()s away is outside the group terminate_group() reaches, and at an
         # exhausted deadline there is no discovery budget to find it. What is
         # required of the harness is not that it wins -- it is that it SAYS SO.
+        assert module.preflight(), 'containment prerequisites unavailable'
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / 'detached'
             children, detached = [], []
@@ -187,27 +242,24 @@ def worker(driver, case):
                 while time.monotonic() < deadline:
                     time.sleep(min(0.001, max(0, deadline - time.monotonic())))
                 diagnostics = io.StringIO()
-                with contextlib.redirect_stderr(diagnostics):
-                    contained = module.cleanup(children[0], deadline)
+                anchor = os.pidfd_open(children[0].pid)
+                try:
+                    with contextlib.redirect_stderr(diagnostics):
+                        contained = module.cleanup(children[0], deadline, anchor=anchor)
+                finally:
+                    os.close(anchor)
                 assert contained is False, 'cleanup claimed success while a descendant survived'
                 assert 'HARNESS CLEANUP FAILURE' in diagnostics.getvalue(), diagnostics.getvalue()
                 assert alive(detached[0]), (
                     'the detached descendant did NOT survive: containment improved, '
                     'so the residual documented on terminate_group() is stale -- update it')
             finally:
-                for child in children:
-                    if child.poll() is None:
-                        try:
-                            os.killpg(child.pid, signal.SIGKILL)
-                        except OSError:
-                            pass
-                        child.kill()
-                    child.wait()
-                for pid in detached:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                # Marker-free: rescue() kills the launcher's group and then
+                # reaps whatever subreaper adoption hands back, so a descendant
+                # this case never managed to name is still recovered -- and the
+                # published one is REAPED rather than left a zombie for somebody
+                # else's supervisor.
+                rescue(module, children)
         print('PASS: detached descendant survived final expiry and the harness said so')
         return
     if case == 'traversal':
@@ -325,7 +377,10 @@ def worker(driver, case):
             stack.enter_context(patch.object(module.os, 'killpg'))
             # Same isolation for the identity anchor. The invented pid owns no
             # real process to anchor, so stand in a real closeable descriptor
-            # rather than weaken run()'s refusal to proceed without one.
+            # rather than weaken run()'s refusal to proceed without one. With
+            # identity-based signalling this is strictly safer than it was: a
+            # /dev/null descriptor is not a pidfd, so the group signal can only
+            # return EBADF -- it cannot reach any group, invented pid or not.
             stack.enter_context(patch.object(
                 module.os, 'pidfd_open',
                 side_effect=lambda pid: os.open(os.devnull, os.O_RDONLY)))
@@ -356,7 +411,7 @@ if __name__ == '__main__':
     if sys.argv[1] == '--worker':
         worker(sys.argv[2], sys.argv[3])
     else:
-        for case in sys.argv[2:] or ['fifo', 'status', 'output', 'result', 'traversal', 'output-fifo', 'result-fifo', 'stderr-full', 'real-expiry', 'expired-cleanup', 'partial-cleanup', 'pidfd-anchor', 'detached-expiry']:
+        for case in sys.argv[2:] or ['fifo', 'status', 'output', 'result', 'traversal', 'output-fifo', 'result-fifo', 'stderr-full', 'real-expiry', 'expired-cleanup', 'partial-cleanup', 'anchor-identity', 'detached-expiry']:
             result = subprocess.run([sys.executable, __file__, '--worker', sys.argv[1], case],
                                     capture_output=True, text=True, timeout=0.3)
             assert result.returncode == 0, result.stdout + result.stderr

@@ -14,6 +14,26 @@ import sys
 import time
 
 PR_SET_CHILD_SUBREAPER = 36
+# pidfd_send_signal(2). The group flag needs Linux 6.9; preflight PROBES it
+# rather than reading a version, because inferring a kernel behaviour instead of
+# constructing it is what put a wrong-group SIGKILL in this file once already.
+SYS_PIDFD_SEND_SIGNAL = 424
+PIDFD_SIGNAL_PROCESS_GROUP = 4
+
+
+def libc_handle():
+    handle = ctypes.CDLL(None, use_errno=True)
+    handle.syscall.restype = ctypes.c_long
+    return handle
+
+
+def pidfd_group_signal(anchor, number):
+    """Signal the group led by the process this descriptor holds. Returns errno."""
+    ctypes.set_errno(0)
+    if libc_handle().syscall(SYS_PIDFD_SEND_SIGNAL, ctypes.c_int(anchor), ctypes.c_int(number),
+                      None, ctypes.c_uint(PIDFD_SIGNAL_PROCESS_GROUP)) == 0:
+        return 0
+    return ctypes.get_errno()
 
 
 def report(message):
@@ -68,7 +88,32 @@ def preflight():
         prerequisite = 'pidfd'
         if not hasattr(os, 'pidfd_open'):
             raise OSError(errno.ENOSYS, 'pidfd_open unavailable')
-        os.close(os.pidfd_open(os.getpid()))
+        prerequisite = 'pidfd-group-flag'
+        probe = os.pidfd_open(os.getpid())
+        try:
+            # Signal 0 carries no signal, so this asks the kernel whether it
+            # ACCEPTS the group flag -- a constructed answer, not a version
+            # string. Two readings are needed because one is not decisive:
+            #
+            #   ESRCH is a PASS. The kernel validated the flag, then looked for
+            #   a group led by this process and found none, because this process
+            #   need not be a group leader. An earlier revision of this probe
+            #   treated ESRCH as failure and so refused every host where the
+            #   harness was not the group leader -- which is most of them.
+            #
+            #   EINVAL is the real failure: the flag word was rejected.
+            #
+            # The undefined-bit call is the probe's own negative control: if it
+            # did NOT return EINVAL, this kernel ignores unknown flags and the
+            # first reading would prove nothing at all.
+            if pidfd_group_signal(probe, 0) not in (0, errno.ESRCH):
+                raise OSError(errno.EINVAL, 'PIDFD_SIGNAL_PROCESS_GROUP')
+            ctypes.set_errno(0)
+            if libc_handle().syscall(SYS_PIDFD_SEND_SIGNAL, ctypes.c_int(probe), ctypes.c_int(0),
+                              None, ctypes.c_uint(1 << 30)) == 0:
+                raise OSError(errno.ENOSYS, 'flag validation absent')
+        finally:
+            os.close(probe)
     except OSError as error:
         report(f'HARNESS SETUP: {prerequisite} prerequisite errno={error.errno}')
         return False
@@ -166,23 +211,28 @@ def capture(child, deadline, known=None):
         raise RuntimeError('injected capture failure')
 
 
-def terminate_group(pid):
-    """Terminate the process group led by pid, without spending discovery time.
+def terminate_group(anchor):
+    """Terminate the process group led by the process this descriptor holds.
 
     run() spawns the launcher with start_new_session=True, so it leads a group
     whose id is its own pid and ordinary descendants inherit that group. One
     syscall, no /proc traversal and no deadline check, so this is still reachable
     when the final deadline is exhausted and every scan below has failed.
 
-    CALLER CONTRACT: hold an identity anchor on pid across every call. run() opens
-    a pidfd immediately after spawning and closes it only after the last group
-    signal. A held pidfd keeps the struct pid referenced, so the kernel cannot
-    recycle that number; since a group id IS its leader's pid, no other process
-    can come to lead a group with this id. Without the anchor this signals a bare
-    number that is recyclable the instant the leader is reaped -- which happens on
-    the ORDINARY success path, where run() waits on the launcher before cleanup.
-    Forced reuse was not reproducible under the sandbox that found this (private
-    PID namespace setup was denied), so the anchor answers a static hazard.
+    IDENTITY, NOT A NUMBER. The signal is addressed to the pidfd, via
+    PIDFD_SIGNAL_PROCESS_GROUP, never to `child.pid`. An earlier revision held a
+    pidfd and then called killpg() on the number, on the stated belief that
+    holding the descriptor kept the number reserved. THAT BELIEF IS FALSE and was
+    falsified by construction, not by argument: free_pid() removes the allocator
+    entry before the later reference release, so the object and the number are
+    independent. A round-6 review forced real reuse -- 4,194,004 serial children
+    in 184 s -- watched pid 323 be reassigned while its original pidfd was open,
+    and watched this function SIGKILL the replacement group. pidfd_send_signal
+    returned ESRCH on that same descriptor at that same moment, which is exactly
+    the distinction: the descriptor knew its target was gone, the number did not.
+
+    preflight() refuses a host whose kernel does not accept the group flag, so
+    there is no silent fallback to a numeric signal.
 
     REFUTED alternative, recorded so it is not re-proposed: "skip the group kill
     once the leader is reaped and nothing is known" looks equivalent and is not.
@@ -192,23 +242,23 @@ def terminate_group(pid):
 
     NAMED RESIDUAL (accepted, not fixed): this cannot reach a descendant that
     called setsid() or setpgid() -- it has left the group, and at an exhausted
-    deadline there is no discovery budget to find it. owned_pids() covers that
-    class whenever any time remains, which is why both paths exist. When neither
-    reaches it, cleanup() returns False and reports HARNESS CLEANUP FAILURE, so
-    the leak is loud rather than silent; the `detached-expiry` regression holds
-    that behaviour. Closing it needs a containment primitive the harness creates
-    before launch -- a per-case cgroup with a group-kill -- not another deadline
-    check, reserve or delayed observation, none of which can supply ownership.
+    deadline there is no discovery budget to find it. owned_pids() attempts that
+    class whenever time remains, within its own deadline and its 1024-record
+    limit, which is why both paths exist; a scan that stops at either bound has
+    not cleared the subtree. When neither path reaches it, cleanup() returns
+    False and reports HARNESS CLEANUP FAILURE, so the leak is loud rather than
+    silent, and the `detached-expiry` regression holds that behaviour. Closing it
+    needs a containment primitive the harness creates before launch -- a per-case
+    cgroup with a group-kill -- not another deadline check, reserve or delayed
+    observation, none of which can supply ownership.
     """
-    if pid is None or pid <= 0 or pid == os.getpgrp():
+    if anchor is None:
         return
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except OSError:
-        pass
+    # ESRCH once the group is empty; nothing else here is actionable.
+    pidfd_group_signal(anchor, signal.SIGKILL)
 
 
-def cleanup(child, deadline, known=None):
+def cleanup(child, deadline, known=None, anchor=None):
     reaped = []
     known = set() if known is None else known
     if child.returncode is None:
@@ -217,7 +267,7 @@ def cleanup(child, deadline, known=None):
     while True:
         # Containment must not depend on remaining time: an exhausted deadline
         # fails every scan below, leaving known = {launcher} and its child alive.
-        terminate_group(child.pid)
+        terminate_group(anchor)
         # Killing known ownership must precede (and survive) a failed scan.
         for pid in known:
             try:
@@ -278,9 +328,21 @@ def run():
         known = set()
         anchor = None
         try:
-            # Pin the launcher's identity before anything can reap it; see the
-            # caller contract on terminate_group().
-            anchor = os.pidfd_open(child.pid)
+            try:
+                # Hold the launcher's identity before anything can reap it; see
+                # the caller contract on terminate_group().
+                anchor = os.pidfd_open(child.pid)
+            except OSError as error:
+                # No anchor means NO containment, because terminate_group() is a
+                # no-op without one. Fail loudly and reap what was just spawned,
+                # rather than continue down a path that cannot contain anything.
+                report(f'HARNESS SETUP: anchor prerequisite errno={error.errno}')
+                try:
+                    os.kill(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                child.wait()
+                return 1
             while not os.path.exists(ready) and time.monotonic() < work_deadline:
                 time.sleep(min(0.01, max(0, work_deadline - time.monotonic())))
             if not os.path.exists(ready):
@@ -314,17 +376,23 @@ def run():
             failed = True
             report(f'HARNESS FAILURE: {type(error).__name__}')
         finally:
+            # The descriptor is released in a finally that encloses everything
+            # able to raise after acquisition -- including BaseException, which
+            # the inner `except Exception` does not catch. A real SIGINT landing
+            # at cleanup's return boundary used to escape past the close.
             try:
-                if not cleanup(child, deadline, known):
+                try:
+                    if not cleanup(child, deadline, known, anchor):
+                        failed = True
+                except Exception as error:
+                    report(f'HARNESS CLEANUP FAILURE: {type(error).__name__}')
                     failed = True
-            except Exception as error:
-                report(f'HARNESS CLEANUP FAILURE: {type(error).__name__}')
-                failed = True
-            if failed and status is not None:
-                report(f'HARNESS FAILURE: launcher_status={status}')
-            if anchor is not None:
-                # Released only after the last group signal.
-                os.close(anchor)
+                if failed and status is not None:
+                    report(f'HARNESS FAILURE: launcher_status={status}')
+            finally:
+                if anchor is not None:
+                    # Released only after the last group signal.
+                    os.close(anchor)
     if failed:
         return 1
     try:
