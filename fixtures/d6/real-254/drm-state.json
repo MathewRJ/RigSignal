@@ -1,6 +1,6 @@
 {
   "captured": "2026-07-03T09:42:00+02:00",
-  "source": "real:.254",
+  "source": "real:fixture-peer.example",
   "connectors": [
     {
       "name": "card0-DP-1",

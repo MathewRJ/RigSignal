@@ -62,7 +62,7 @@ D3 selects journal boots by explicit normalized boot ID, never a relative
 It validates that an end-oriented tail reaches the boot’s last entry before
 using absent shutdown markers; an early `steam: Shutdown` log line is not a
 clean OS shutdown. Journal retention can still remove relevant history. The
-2026-07-21 `.254` capture lost boot-time enumeration during an RTC-jump
+2026-07-21 capture from the gaming host lacked boot-time enumeration after an RTC-jump
 rotation even with persistent journald, so `history-unavailable` is an honest
 result rather than a healthy claim.
 

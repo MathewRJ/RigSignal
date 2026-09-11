@@ -21,7 +21,7 @@ goal: >
   the marker, and the clean-stack gate script's scenario legs. It does NOT implement or touch
   the §5 transport addendum (TLS loopback proxy, `:5601` block) — that is a separate,
   owner-host deployment task, explicitly out of scope here (see Non-goals). It also does NOT
-  perform any live invocation against the owner cluster `192.168.50.174` — all new legs run
+  perform any live invocation against the owner cluster `192.0.2.174` — all new legs run
   against ephemeral clean-stack Docker containers, exactly like the existing adoption-gate.sh
   pattern.
 

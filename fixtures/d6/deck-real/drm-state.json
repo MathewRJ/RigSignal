@@ -1,6 +1,6 @@
 {
   "captured": "2026-07-03T09:45:00+02:00",
-  "source": "real:.26",
+  "source": "real:fixture-deck.example",
   "connectors": [
     {
       "name": "card0-DP-1",

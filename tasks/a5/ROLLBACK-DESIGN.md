@@ -1,9 +1,9 @@
 # Owner-bundle apply/rollback design — v3
 
-Session: `2026-07-24d-owner-bundle`. Target: owner cluster `192.168.50.174`
+Session: `2026-07-24d-owner-bundle`. Target: owner cluster `192.0.2.174`
 (ES `https://…:9200`, Kibana currently `http://…:5601` — see STOP #1 below).
 Gate: overseer + Codex-Sol double gate before any implementation or live use.
-Principal: `dev@192.168.50.144` (NUC), per the ratified session plan.
+Principal: `dev@192.0.2.144` (NUC), per the ratified session plan.
 
 This is a **design document**, not executable code. Phase pseudocode below is
 concrete enough for a Codex implementation task to build a script in the style
@@ -45,7 +45,7 @@ other three, plus one shared change, land in `FLEET-COEXISTENCE-AMENDMENT-DRAFT.
 | R2-2 | Dashboard/saved-object adapters bypassed the module contract — specify all four functions incl. absent-preimage case | Adopted — new §1.3, dashboard row in §1.2's table now points at it instead of describing the mechanism inline |
 | R2-3 | Journal after-pin: `write_intent` must atomically persist `intended_after_sha256` + a durable request-body reference before the mutation; ambiguous-crash rule compares against the persisted after-pin; dashboard intents carry per-object hashes | Adopted — §5 rewritten |
 | R2-4 | Component-template adapter row scoping: state explicitly that Fleet-owned components route through §3 verify-only *before* adapter selection, and the generic row applies to bundle-owned members only | Adopted — new routing-order note before §1.2's table |
-| R2-5 | Transport: (a) label the accepted-risk `:5601` option as a new deviation needing its own fresh gate; (b) fix key-location statement — CA key stays on `.144`, deployed leaf key/cert live on `.174` at a protected path, with staging-shred + rollback removal | Lands in `FLEET-COEXISTENCE-AMENDMENT-DRAFT.md` §5; this document's TLS-proxy teardown capsule (§Capsules) is extended to name the owner-host artifacts explicitly, per (b) |
+| R2-5 | Transport: (a) label the accepted-risk `:5601` option as a new deviation needing its own fresh gate; (b) fix key-location statement — CA key stays on `192.0.2.144`, deployed leaf key/cert live on `192.0.2.174` at a protected path, with staging-shred + rollback removal | Lands in `FLEET-COEXISTENCE-AMENDMENT-DRAFT.md` §5; this document's TLS-proxy teardown capsule (§Capsules) is extended to name the owner-host artifacts explicitly, per (b) |
 | R2-6 | `DIFF-REPORT.md`'s stale "pipeline comparison is exact body equality; pipeline GET is denied" normalization bullet; correct "four server timestamps" prose to match what the capture actually shows (two `_millis` fields observed; all four still stripped defensively by the projection) | Lands in `DIFF-REPORT.md`; this document's §1.1/§4 pipeline-timestamp prose corrected to match (projection still strips all four defensively) |
 
 ## Inputs
@@ -353,7 +353,7 @@ unaffected by this section.
 
 | Capsule | Status this session | Notes |
 |---|---|---|
-| TLS proxy listener + CA on `.174` | No deployment made — `tls-proxy/ROLLBACK.md` confirms nothing to remove today | **New (Overseer #2), owner-host artifacts named explicitly (Sol round 2):** once A5 §5's transport path is deployed, its teardown capsule must cover the `:5643` listener, its systemd unit, any firewall rule, and — split by host, per A5 §5's corrected key-location statement — (a) on `.174` (owner host): the deployed leaf key/cert pair at `/etc/nginx/rigsignal-tls/` (`root:root`, dir `0750`, key `0600`, cert `0644`) and any un-shredded staging copy; teardown removes the deployed leaf key/cert from `.174` and confirms the listener is gone; (b) on `.144` (NUC): the proxy CA's own private key is the durable signing authority and is **not** removed by a single deployment's rollback (it survives to sign a future re-deployment) — only a full A5 decommission would retire it. This design does not yet specify the removal script because nothing is deployed; it must land before the proxy is ever used for a live invocation, not retrofitted after. STOP #1 (plaintext Kibana `:5601`) resolution and the §5.5 remote-`:5601`-block open ratification item are A5 §5's track, not this design's. |
+| TLS proxy listener + CA on `192.0.2.174` | No deployment made — `tls-proxy/ROLLBACK.md` confirms nothing to remove today | **New (Overseer #2), owner-host artifacts named explicitly (Sol round 2):** once A5 §5's transport path is deployed, its teardown capsule must cover the `:5643` listener, its systemd unit, any firewall rule, and — split by host, per A5 §5's corrected key-location statement — (a) on `192.0.2.174` (owner host): the deployed leaf key/cert pair at `/etc/nginx/rigsignal-tls/` (`root:root`, dir `0750`, key `0600`, cert `0644`) and any un-shredded staging copy; teardown removes the deployed leaf key/cert from `192.0.2.174` and confirms the listener is gone; (b) on `192.0.2.144` (NUC): the proxy CA's own private key is the durable signing authority and is **not** removed by a single deployment's rollback (it survives to sign a future re-deployment) — only a full A5 decommission would retire it. This design does not yet specify the removal script because nothing is deployed; it must land before the proxy is ever used for a live invocation, not retrofitted after. STOP #1 (plaintext Kibana `:5601`) resolution and the §5.5 remote-`:5601`-block open ratification item are A5 §5's track, not this design's. |
 | Temporary credentials | Not yet exercised in this draft | Must fix the Phase 0.5 credential-hygiene STOP (0664 secret file) before implementation: mirror `live-migration-m1.sh`'s `CRED_FILE="$(mktemp)"; trap 'rm -f "$CRED_FILE"' EXIT` pattern and explicitly `chmod 0600`/verify the mode, not just remove-on-exit |
 | Local enrollment generation | §2 | reuse installer's own guarded removal, not `rm -rf` |
 | Kibana saved objects | §1 | enumerated deletes only, journaled as pre-import intents (§5) |

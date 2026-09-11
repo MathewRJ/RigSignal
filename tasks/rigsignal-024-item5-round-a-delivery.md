@@ -67,7 +67,7 @@ the spec conflict, the spec+addendum win; report the conflict.
 crash/replay → identical `_id` (byte-identical identity input); truncation reset;
 replacement/new-generation; rotated-file drain; partial-line hold + reread; DST-ambiguous
 earlier choice; oversize-line consume+advance; parser fixture for the spec's example line
-(`[2026-07-17 09:09:44] Client 10364467328988576325 (GamingPC) connected via direct
+(`[2026-07-17 09:09:44] Client 1000000000000000001 (fixture-peer.example) connected via direct
 connection`) and a disconnect variant; transport mapping incl. missing `via`; no-local-game
 document omits session/game groups. Existing shipper tests unchanged and green.
 

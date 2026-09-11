@@ -37,7 +37,7 @@ the same bug surfacing later or an independent break — verify separately.
 2. Reproduce locally: run the agent, check whether the fields are absent at emission (spool
    NDJSON) or dropped at ingest (pipeline). Field-name drift vs `fields.yml` is a known failure
    class (see feedback_field_audit_before_deploy).
-3. Check `.254`/`.162` live spool files for the fields to split agent-side vs pipeline-side.
+3. Check live spool files on the gaming host and the streaming client for the fields to split agent-side vs pipeline-side.
 4. For `power.ac_connected`: correlate the ~2026-07-13 death with deploys/changes around 0.2.x.
 
 ## Acceptance

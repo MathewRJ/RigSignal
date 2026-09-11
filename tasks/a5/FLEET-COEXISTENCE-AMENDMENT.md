@@ -12,7 +12,7 @@ Do not cite this document as contract text before then.
   INVENTORY.tsv, CLUSTER-HEALTH.md, PREFLIGHT-REPORT.md, KEY-LIFECYCLE.md,
   BINARY-PROVENANCE.md, tls-proxy/}`. All owner-cluster requests behind this evidence were
   read-only GETs plus three documented read-only `_search` POSTs and exactly one authorized
-  mint/invalidate API-key pair; no owner-cluster write touched `.254`/`.162` writer state.
+  mint/invalidate API-key pair; no owner-cluster write touched writer state on the gaming host or the streaming client.
 - **What this amends:**
   - `tasks/rigsignal-p1-provisioning-order.md` §"v2.2 Exact fresh fence, archive gate, and
     complete barrier" — specifically the unconditional obligation at line 263, "Install and
@@ -59,7 +59,7 @@ verbatim into §1/§2/§3 below).
 | 8 | Sol #5 | Marker granularity: 55 manifest assets not 65 expanded objects; manifest split is 16 owned / 39 external | Adopted — §2.5 (marker semantics) and §1 both now distinguish the illustrative expanded count (66, per-object) from the authoritative manifest-level split (16/39 of 55) |
 | 9 | Sol #5 | `_meta.package` has no version field live | Adopted — §3.1 no longer claims/refuses on absent version; records `version: null` verbatim or queries Fleet API separately |
 | 10 | Sol #6 | Stream counts / rollover semantics inconsistent, three-way rollover handling needed | Adopted — §3.2, §3.3, new rollover-cases text |
-| 11 | Sol #7 | Transport security claims overstated: broadened trust not stated; Kibana `:5601` is `0.0.0.0`, not loopback; listener must allow `.144` | Adopted — §5 rewritten: honest broadened-trust statement, corrected listener scope, NEW gate requirement to block remote plaintext `:5601`, flagged OPEN RATIFICATION ITEM with blast-radius note |
+| 11 | Sol #7 | Transport security claims overstated: broadened trust not stated; Kibana `:5601` is `0.0.0.0`, not loopback; listener must allow `192.0.2.144` | Adopted — §5 rewritten: honest broadened-trust statement, corrected listener scope, NEW gate requirement to block remote plaintext `:5601`, flagged OPEN RATIFICATION ITEM with blast-radius note |
 | 12 | Sol #4 | Proof deletion conflicts with ratified A4 §5.4 | Adopted — new §8, narrowly scoped, flagged for explicit owner ratification, does not assert already-ratified |
 | — | (evidence) | Wire gate PASS 109/109; native-user credential confirmed | `BINARY-PROVENANCE.md` final section and `PREFLIGHT-REPORT.md` addendum. Sol's "Release/live STOP" is cleared; overseer blocker 5 is cleared. §6 below notes the credential is confirmed available, not merely required. |
 
@@ -75,7 +75,7 @@ other three, plus one shared change, land in `ROLLBACK-DESIGN.md`). This is v3.
 | R2-2 | Dashboard/saved-object adapters bypassed the module contract | Lands in `ROLLBACK-DESIGN.md` §1.3 (new); this document is unaffected since it does not itself specify adapter internals |
 | R2-3 | Journal after-pin / ambiguous-crash rule extension | Lands entirely in `ROLLBACK-DESIGN.md` §5 |
 | R2-4 | Component-template adapter routing order | Lands entirely in `ROLLBACK-DESIGN.md` §1.2 |
-| R2-5 | Transport: (a) label the accepted-risk `:5601` option a new deviation requiring its own fresh gate; (b) fix key-location statement — CA key on `.144`, deployed leaf key/cert on `.174` at a protected path, staging-shred + rollback removal | Adopted — §5 (item 1's key-location text, and the open-ratification-item paragraph) rewritten |
+| R2-5 | Transport: (a) label the accepted-risk `:5601` option a new deviation requiring its own fresh gate; (b) fix key-location statement — CA key on `192.0.2.144`, deployed leaf key/cert on `192.0.2.174` at a protected path, staging-shred + rollback removal | Adopted — §5 (item 1's key-location text, and the open-ratification-item paragraph) rewritten |
 | R2-6 | `DIFF-REPORT.md` stale normalization bullet; correct "four server timestamps" prose | Lands in `DIFF-REPORT.md`; this document's §0 pipeline-correction prose corrected to match (projection still strips all four defensively, only the two `_millis` fields are observed on this cluster) |
 
 ---
@@ -466,11 +466,11 @@ pass would otherwise have re-flagged.**
 combined-CA design and mis-scoped the listener/Kibana-binding requirements.**
 
 1. **The deviation.** The owner Kibana endpoint is reached in plaintext HTTP at
-   `192.168.50.174:5601` (`PREFLIGHT-REPORT.md` P0.2), which the pinned installer's
+   `192.0.2.174:5601` (`PREFLIGHT-REPORT.md` P0.2), which the pinned installer's
    `https_origin()` check rejects outright. Kibana currently listens on `0.0.0.0:5601` — **not**
    loopback (`tls-proxy/PROXY-REPORT.md:43`) — so it is reachable directly from the network
    today, proxy or no proxy. The proposed remediation is a TLS-terminating loopback proxy on
-   `192.168.50.174:5643` in front of that HTTP listener, so the installer sees an HTTPS origin.
+   `192.0.2.174:5643` in front of that HTTP listener, so the installer sees an HTTPS origin.
    Because the existing Elasticsearch CA's private key is root-locked (`/etc/elasticsearch` is
    `root:elasticsearch`, inaccessible without `sudo`, confirmed non-interactive-`sudo`-denied —
    `tls-proxy/PROXY-REPORT.md`), the proxy's server certificate cannot be signed by the real ES
@@ -479,21 +479,21 @@ combined-CA design and mis-scoped the listener/Kibana-binding requirements.**
    minted `2026-07-24T16:05:36Z`) to sign the loopback listener's certificate. **Key-location
    statement, corrected (Sol round 2 — the v2 text wrongly placed both keys on the NUC; the
    listener runs on the owner host, so its key must too):**
-   - The **proxy CA's own private key** stays on the NUC (`.144`), mode `0600`, never committed
+   - The **proxy CA's own private key** stays on the NUC (`192.0.2.144`), mode `0600`, never committed
      to any repository — it is the signing authority and never needs to leave the host that
      mints certificates with it.
    - The **issued leaf key/cert pair actually used by the `:5643` listener** is *deployed to the
-     owner host* (`.174`) — a proxy that terminates TLS locally must hold its serving key
+     owner host* (`192.0.2.174`) — a proxy that terminates TLS locally must hold its serving key
      locally; a leaf key that never left the NUC could not be used by a listener running on
-     `.174`. Protected location: `/etc/nginx/rigsignal-tls/` (owner-host-local, matching the
+     `192.0.2.174`. Protected location: `/etc/nginx/rigsignal-tls/` (owner-host-local, matching the
      proxy's expected reverse-proxy implementation), owned `root:root`, directory mode `0750`,
      leaf **key** file mode `0600`, leaf **cert** file mode `0644` (public by nature). Any
-     staging copy used to transfer the leaf key/cert to `.174` (e.g. a `/tmp` file used during
+     staging copy used to transfer the leaf key/cert to `192.0.2.174` (e.g. a `/tmp` file used during
      `scp`/deployment) MUST be shredded (`shred -u`, not `rm`) immediately after the protected
      copy is confirmed in place and its mode verified — mirroring this session's own
      credential-hygiene lesson (`KEY-LIFECYCLE.md`'s 0664-not-shredded STOP). Rollback of this
-     capsule removes the deployed leaf key/cert from `/etc/nginx/rigsignal-tls/` on `.174`; the
-     proxy CA's private key on `.144` is never touched by a rollback of a single deployment (it
+     capsule removes the deployed leaf key/cert from `/etc/nginx/rigsignal-tls/` on `192.0.2.174`; the
+     proxy CA's private key on `192.0.2.144` is never touched by a rollback of a single deployment (it
      is the durable signing authority, re-usable for a future re-deployment). See
      `ROLLBACK-DESIGN.md`'s TLS-proxy teardown capsule, extended to name these owner-host
      artifacts explicitly.
@@ -506,7 +506,7 @@ combined-CA design and mis-scoped the listener/Kibana-binding requirements.**
    simultaneously," not "each call gets its own independently-scoped opener."
 3. **Honest trust consequence — corrected, this is the load-bearing fix of gate round 1:** the
    proxy CA becomes trusted for Elasticsearch too, for the duration of the invocation. Because
-   ES and the proxy share IP `192.168.50.174`, **compromise of the proxy CA's private key could
+   ES and the proxy share IP `192.0.2.174`, **compromise of the proxy CA's private key could
    be used to issue a certificate the installer would accept for the Elasticsearch endpoint** —
    the prior draft's claim that the proxy CA "cannot be used to impersonate the ES cluster
    itself" is **withdrawn**; that claim only held under the false premise of per-call opener
@@ -517,16 +517,16 @@ combined-CA design and mis-scoped the listener/Kibana-binding requirements.**
    payload crosses the network boundary; (c) the dedicated proxy CA signs only the loopback
    listener certificate today. But the broadened trust is real and MUST be recorded as such, not
    minimized.
-4. **Listener scope, corrected:** the `:5643` listener MUST accept connections from `.144` (the
+4. **Listener scope, corrected:** the `:5643` listener MUST accept connections from `192.0.2.144` (the
    real installer host, running the Phase 4 invocation) plus explicitly authorized local health
    checks — a "loopback/owner-host connections only" restriction, as the original draft implied,
-   would reject the actual installer and make the proxy useless. Restricting to `.144` plus
-   loopback (not open to the whole `192.168.50.0/24`) is the correct source-address scope.
+   would reject the actual installer and make the proxy useless. Restricting to `192.0.2.144` plus
+   loopback (not open to the whole `192.0.2.0/24`) is the correct source-address scope.
 5. **NEW gate requirement — remote plaintext `:5601` must be blocked.** Merely standing up the
    `:5643` proxy does not close the existing `0.0.0.0:5601` plaintext listener; anything on the
    network can still bypass the proxy and hit Kibana directly. Before this transport path may be
    used for any live provisioning invocation, `:5601` MUST be bound to loopback or firewalled
-   against all non-loopback sources, with **proof that a direct remote connection to `.174:5601`
+   against all non-loopback sources, with **proof that a direct remote connection to `192.0.2.174:5601`
    fails** (not merely that the proxy path succeeds).
 
    **This is an OPEN RATIFICATION ITEM, not yet resolved in this draft**, because of its
@@ -558,16 +558,16 @@ combined-CA design and mis-scoped the listener/Kibana-binding requirements.**
    - plaintext-HTTP (a request that bypasses the proxy and hits `:5601` directly is refused,
      not silently accepted — this now requires the §5.5 block to be in place, not merely that the
      installer's own `https_origin()` check would reject it if pointed there)
-   - source-address (the proxy accepts `.144` and authorized local health checks; rejects other
+   - source-address (the proxy accepts `192.0.2.144` and authorized local health checks; rejects other
      sources)
    - consumer-smoke (a real Kibana API call round-trips correctly through the proxy)
    - persistence (the proxy survives a reboot/restart in whatever form it is deployed — systemd
      unit or otherwise)
-   - certificate (SAN `IP:192.168.50.174`, `CA:false` on the leaf, `serverAuth` key usage,
+   - certificate (SAN `IP:192.0.2.174`, `CA:false` on the leaf, `serverAuth` key usage,
      expiry, unrelated-CA rejection, matching the minted proxy CA's issued leaf)
 7. **Current status — OPEN, not cleared.** `tls-proxy/PROXY-REPORT.md` and
    `tls-proxy/ROLLBACK.md` (captured 16:03–16:04 UTC) record a STOP: no listener, certificate,
-   proxy package, systemd unit, or firewall rule was created on `.174`, because at that time the
+   proxy package, systemd unit, or firewall rule was created on `192.0.2.174`, because at that time the
    ES CA private key was believed required. The dedicated proxy CA bundle
    (`tls-proxy/installer-ca-bundle.pem`, minted 16:05:36 UTC) exists as a prepared artifact and
    is consistent with the resolution path above, but **no report in this evidence directory
@@ -720,7 +720,7 @@ rest of this amendment.
       (2) §8 A4 exception RATIFIED (transaction-scoped exact-ID proof deletion on
       explicit rollback only);
       (3) §5.5 transport: BLOCK remote plaintext :5601 + migrate NUC consumers to
-      https://192.168.50.174:5643 (+combined CA) as a prep task in the
+      https://192.0.2.174:5643 (+combined CA) as a prep task in the
       implementation session, before the live run. Accepted-risk option rejected.
 
 Design ratified at DRAFT v3. Per §4.3 the amendment still re-gates at the

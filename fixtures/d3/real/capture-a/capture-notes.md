@@ -2,19 +2,19 @@
 
 **Capture timestamp (UTC):** 2026-07-21T17:40:48Z (system local time CEST = UTC+2)
 **Box:** `USER-REDACTED@IP-REDACTED`, label `capture-a`
-**Identity:** hostname `HOST-REDACTED-A`, current boot_id `ff328246799946ed942a144a39e98aca`
+**Identity:** hostname `HOST-REDACTED-A`, current boot index `0`
 **Kernel (current boot):** `6.16.12-drmexec7-valve24.5-1-neptune-616-drm-exec-gf253f5da553e`
 **dGPU under test:** `0000:03:00.0`, vendor `0x1002` device `0x7550` (RX 9070 XT), class `0x030000`
 **Note:** box is multi-boot (SteamOS / Windows / CachyOS). Windows and CachyOS boots leave **no journald entries at all** — `journalctl --list-boots` only enumerates SteamOS (systemd-journald) boots. A gap in the boot-ID sequence's wall-clock timeline (vs. what the user may recall booting) is expected and does not indicate journal loss; it indicates a non-Linux or non-journald boot occurred in between.
 
-## journalctl --list-boots (full output)
+## journalctl --list-boots (boot IDs omitted for publication)
 
 ```
-IDX BOOT ID                          FIRST ENTRY                  LAST ENTRY
- -3 bd02540cbced4afa8a20595b84a5904d Mon 2026-07-20 22:21:55 CEST Mon 2026-07-20 23:11:03 CEST
- -2 21331ffc06674eecb6b2fab9ce830ac3 Tue 2026-07-21 09:13:13 CEST Tue 2026-07-21 10:11:16 CEST
- -1 9916ef9514524f68ab083e333016d225 Tue 2026-07-21 10:11:40 CEST Tue 2026-07-21 11:07:33 CEST
-  0 ff328246799946ed942a144a39e98aca Tue 2026-07-21 11:07:58 CEST Tue 2026-07-21 19:39:10 CEST (ongoing at capture time)
+IDX FIRST ENTRY                  LAST ENTRY
+ -3 Mon 2026-07-20 22:21:55 CEST Mon 2026-07-20 23:11:03 CEST
+ -2 Tue 2026-07-21 09:13:13 CEST Tue 2026-07-21 10:11:16 CEST
+ -1 Tue 2026-07-21 10:11:40 CEST Tue 2026-07-21 11:07:33 CEST
+  0 Tue 2026-07-21 11:07:58 CEST Tue 2026-07-21 19:39:10 CEST (ongoing at capture time)
 ```
 
 Only boots -1, -2, -3 were captured per spec (current boot is 0). No boot -4 or older exists in the retained journal (list-boots only goes to -3), so nothing was skipped.

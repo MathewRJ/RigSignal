@@ -241,7 +241,7 @@ skips fail-closed; finding or installing an agent alone does not enable pruning.
 ## [0.2.4] — 2026-07-18
 
 0.2.4 arc: gpu_sched legacy port + fleet TSDS fix (shipped 2026-07-17), then item 5
-(client stream telemetry) + P4 (PipeWire re-source), live-validated on the StreamClient
+(client stream telemetry) + P4 (PipeWire re-source), live-validated on a streaming-client host
 (spec: `RIGSIGNAL-024-ITEM5-SPEC.md` in the Workflow repo, incl. Addendum 2026-07-18).
 
 ### Added

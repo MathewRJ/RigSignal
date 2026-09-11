@@ -64,7 +64,7 @@ non-`ok` verdict to exit 1 — a literal extraction gives D3 wrong exits (`recov
 `fixtures/d3/` does not exist in RigSignal yet. Freeze and normalize:
 
 - Copy the Workflow captures (`scenario-testing/diagnostics/fixtures/d3/`, including
-  `captures-2026-07-21/{gamingpc-254,streamclient-162}/` with `pci-topology.txt` — parent
+  `captures-2026-07-21/{fixture-peer.example,fixture-client.example}/` with `pci-topology.txt` — parent
   chains + boot IDs, both boxes, captured 2026-07-21) into repo `fixtures/d3/` under
   **normalized stable names**; record `fixtures/d3/MANIFEST.md` with sha256 + provenance
   (real-capture vs SYNTHETIC clearly separated). Decompress the old
@@ -87,14 +87,14 @@ by the 2026-07-21 captures). Sysfs is the **authoritative** presence/identity so
 
 **Journald collection** (all bounded, all failures typed):
 - Boot inventory via `journalctl --list-boots` → select boots by **explicit boot ID**, never
-  bare `-b -1` offsets internally (multi-boot: .254 runs Windows/CachyOS between Linux boots).
+  bare `-b -1` offsets internally (multi-boot: the gaming host runs Windows/CachyOS between Linux boots).
 - All queries: `--no-pager -o short-iso-precise`, `LC_ALL=C`, explicit timeout, exit
   status + stderr checked, bounded output. Prior-boot kernel evidence collected as an
   **end-oriented window** (tail of that boot) so a byte cap can never truncate the end.
-- Prior full-boot tail (NOT `-k`; shutdown markers are userspace — verified live on .254)
+- Prior full-boot tail (NOT `-k`; shutdown markers are userspace — verified live on the gaming host)
   for shutdown evidence. **Validate the tail actually reaches the boot's last entry per the
   boot inventory before interpreting missing markers.** Shutdown patterns anchor near the
-  terminal tail — the real .254 capture contains an early `steam: Shutdown` line that a
+  terminal tail — the real fixture-peer.example capture contains an early `steam: Shutdown` line that a
   naive grep misreads as a clean OS shutdown.
 - Any journal collection failure → `missing_evidence` entry; it never erases a sysfs-proven
   finding and never becomes exit 2 on its own (exit-2 causes listed under the table).
@@ -179,7 +179,7 @@ redaction unit tests. D6's strip-and-truncate helper is insufficient — extend 
   boot identity (`--boot-list` or `--current-boot-id`). Journal inputs optional — absence is
   typed `missing_evidence` (models real rotation). Offline NEVER fills an omitted input from
   live collection. Unpairable current/prior fixtures → exit 2.
-- **Learning:** requires explicit `--slot` (multi-GPU is real: .254 has dGPU `03:00.0` AND
+- **Learning:** requires explicit `--slot` (multi-GPU is real: the gaming host has dGPU `03:00.0` AND
   iGPU `7b:00.0`, both class `0x030000` — heuristics cannot pick); refuses to overwrite an
   existing baseline; live or offline (offline learn = replay seeding path).
   `--reset-baseline` is idempotent and mutually exclusive with learn/diagnose.
@@ -241,7 +241,7 @@ smoke; NO cargo test; clippy without `--all-targets`)
 `docs/diagnose-gpu-boot.md` (mirror diagnose-display.md): usage, precedence/verdict table,
 learn/reset workflow (explicit `--slot`), **SSH note — black-screen users run this over SSH;
 enabling sshd beforehand is part of setup**, multi-boot caveat, journal-retention caveat
-(real evidence: .254 lost boot-time enumeration to an RTC-jump rotation even on persistent
+(real evidence: the gaming host lost boot-time enumeration to an RTC-jump rotation even on persistent
 journald — capture provenance 2026-07-21), redaction statement. Plus `fixtures/d3/README.md`
 provenance and the §0 doc updates (`d6.2`).
 
@@ -259,7 +259,7 @@ provenance and the §0 doc updates (`d6.2`).
   exactly one `recovered` → immediate rerun → `ok`. Plus: synthetic precursor → `precursor-
   warning`; real clean 2026-07-21 capture → `ok`; omitted prior journal → typed missing-
   evidence with correct verdict class; edited different-ID snapshot → `hardware-changed`
-  with no power-drain advice; live healthy run on `.254` (real journalctl + sysfs) →
+  with no power-drain advice; live healthy run on the gaming host (real journalctl + sysfs) →
   `ok`/`baseline-required`.
 - Verdict-language audit: no absolute causal claims; all five contract fields present on
   every finding (`missing_evidence` may legitimately be empty).
@@ -267,7 +267,7 @@ provenance and the §0 doc updates (`d6.2`).
 ## Explicitly deferred (not this task)
 
 - Elastic Agent journald log-shipping auto-capture (design-doc phase 2).
-- Split-lock journal-spam detector (real .254 hazard; separate candidate).
+- Split-lock journal-spam detector (real hazard on the gaming host; separate candidate).
 - "Failed to export SMU metrics" precursor patterns (no captured example yet).
 - Automatic dGPU discovery; state schema migration; multi-finding history ring.
 - gpu_fence/present-interval probes, NIC counters (telemetry freeze).

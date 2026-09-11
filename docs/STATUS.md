@@ -3,6 +3,20 @@
 Last updated: 2026-09-09 (0.3.5 release)
 Active streams: main (local ElasticHome deployment) + offline (air-gapped, not yet forked)
 
+## Publication hygiene — 2026-09-10
+
+Captured host references in prose now use synthetic `.example` names and documentation
+addresses. Producer link-local IPv6 addresses in journal tails now use a documentation
+address; public DNS/NTP endpoints remain. Boot IDs are omitted from capture-note tables. Assertion-bearing test data and
+boot-pairing fixture IDs are retained; dashboard selectors are reserved for a separate PR.
+
+**Removal at HEAD does NOT unpublish.** These identifiers are already inside released
+archives, and AUR clones the full repository at every version. Only history rewriting would
+unpublish them from repository history, and that breaks every clone and AUR's `pkgver()`;
+it cannot recall archives or clones already distributed. This is a hygiene change for what
+ships next, not retrospective remediation. Historical command examples use placeholders
+and must be adapted before use.
+
 ## Decision record — supported stack floor (supersedes TK-4, 2026-08-27)
 
 Supported Elasticsearch/Kibana: **9.4.3 or newer**, Kibana at the same version — a **floor with no
@@ -114,19 +128,19 @@ fail-closed; pruning is a per-host outcome, not a portable guarantee.
 **0.2.5 released + deployed 2026-07-19** (tag `v0.2.5`, RigSignal `34882fe`). Delivers S2 spool
 durability + hardening and S1 probe-as-TSDS-dimension. The A6-24h retention gate PASSED at
 2026-07-19T18:43:24Z and was sealed before release; the 0.2.5 agent (`dca30eae`) is live on both
-StreamClient `.162` and GamingPC `.254` with zero-gap continuity. eBPF daemons deferred
+the streaming-client and gaming hosts with zero-gap continuity. eBPF daemons deferred
 (version-string-only rebuild).
 
 **0.3.0 released 2026-07-21** (tag `v0.3.0`). Ships D6, RigSignal's first diagnostic-evidence-engine
 detector: `rigsignal-agent diagnose display` compares a Gamescope `modes.cfg` override against
 DRM display state and reports a verdict, cited evidence, confidence, and a falsifier (exit
 contract 0/1/2). D6 shipped end-to-end through a 5-stage QC chain (Codex-sparred spec, reviewer
-approval, adversarial hardening, and a live `.254` replay that caught 2 live-path bugs invisible
+approval, adversarial hardening, and a live gaming-host replay that caught 2 live-path bugs invisible
 to tests/review). Also in this release: `host.name` canonical-lowercase normalization at every
 emission boundary, and pinned/hardened eBPF release-build toolchain. See `CHANGELOG.md` and
 `.github/RELEASE_NOTES.md` for the full release notes.
 
-**Deployment.** The local ElasticHome Elasticsearch stack is active (cloud migrated 2026-07-09). Agents run on GamingPC (`.254`) and StreamClient (`.162`) in spool-file output mode.
+**Deployment.** The local ElasticHome Elasticsearch stack is active (cloud migrated 2026-07-09). Agents run on the gaming host and the streaming client in spool-file output mode.
 
 **Distribution.** `rigsignal-git` is live on AUR and `install.sh` is live (now installing pre-built
 eBPF from the Linux tarball as of 0.3.0). `.deb`/`.rpm`/`.pkg.tar.zst` packages are agent-only (no
@@ -152,7 +166,7 @@ gate; see `docs/diagnose-gpu-boot.md`.
   `nearest_alternative`. Exit contract: `0` for `ok`/`not-applicable`, `1` for a real finding,
   `2` for incomplete/invalid invocation. `--json` and `--host` flags supported.
   Shipped through a 5-stage QC chain (Codex-sparred spec, reviewer approval, adversarial
-  hardening, and a live `.254` replay that caught 2 live-path bugs invisible to tests/review); see
+  hardening, and a live gaming-host replay that caught 2 live-path bugs invisible to tests/review); see
   `docs/diagnose-display.md` for the full field reference and a real replay transcript.
 - **`host.name` normalization**: all emission boundaries (agent, eBPF daemon, events tailer) now
   trim and lowercase `host.name` consistently, fixing dashboards that were splitting one physical
@@ -357,7 +371,7 @@ Commit: 561dc78
 ## Environment
 
 - Primary dev host: CachyOS Linux (AMD Ryzen 7 9800X3D / Radeon RX 9070 XT)
-- Agent hosts: GamingPC (`.254`) and StreamClient (`.162`), both using spool-file output mode
+- Agent hosts: the gaming host and the streaming client, both using spool-file output mode
 - ES endpoint: local ElasticHome Elasticsearch stack (migrated from cloud 2026-07-09)
 - Repo: github.com/MathewRJ/RigSignal
 

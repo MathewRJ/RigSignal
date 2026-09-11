@@ -27,8 +27,8 @@ CHRONO_SESSION=2026-07-21c-d6-rust-port
   `ok`. See `detect_d6_display_mode.py` for the exact reference logic (`AREA_RATIO_MAX=0.5`,
   `ASPECT_TOLERANCE=0.05`).
 - **Fixture provenance matrix (do not alter):** `fixtures/d6/deck-real/drm-state.json` is the real
-  .26 good-state capture and has `active_mode: 3840x2160@120`; `real-254/drm-state.json` is real
-  and lacks `active_mode`; `deck-incident-bad/drm-state.json` is the real .26 base with only
+  fixture-deck.example good-state capture and has `active_mode: 3840x2160@120`; `real-254/drm-state.json` is real
+  and lacks `active_mode`; `deck-incident-bad/drm-state.json` is the real fixture-deck.example base with only
   `active_mode` synthetically mutated to `1280x800@60`. Missing `active_mode` is therefore normal
   and must be treated as unknown, skipping the active-resolution check; do not invent EDID DTD
   parsing or another active-mode source in this task.
@@ -134,7 +134,7 @@ CHRONO_SESSION=2026-07-21c-d6-rust-port
    - Add contract tests for every real finding: confidence bounds, non-empty evidence/plain
      language/suggested fixes/falsifier/confidence basis, and `rule_version == "d6.1"`; add
      all-unparsable and nothing-validatable outcome tests.
-   - Add parser unit tests using the captured real `.254` and Deck `gamescopectl.txt` stdout,
+   - Add parser unit tests using the captured real `fixture-peer.example` and Deck `gamescopectl.txt` stdout,
      asserting connector, make, model, and refresh-rate parsing without regex.
    - Add CLI integration tests for Clap nesting, every exit-code class (including explicit bad
      fixture, incomplete error, and not-applicable/no-op), one-line JSON shape for diagnosis and
@@ -144,9 +144,9 @@ CHRONO_SESSION=2026-07-21c-d6-rust-port
 
 4. **Live-replay verification (manual, required before merge; document in the RESULT file):**
    after review and CI pass but before merge, run the exact candidate binary on Gaming PC
-   (`deck@192.168.50.254`) uninstalled. First preflight the current connector and its sysfs
+   (`deck@192.0.2.254`) uninstalled. First preflight the current connector and its sysfs
    `modes`; only if `1280x800` remains advertised, seed the known bad line adapted from
-   `deck-incident-bad` to .254's live connector: `AOC AG352UCG6:1280x800@60` (preserve any required
+   `deck-incident-bad` to the gaming host's live connector: `AOC AG352UCG6:1280x800@60` (preserve any required
    line format/flags). It must yield `mode-override-degraded`, confidence `0.85`, and exit 1 — do
    not accept merely any non-`ok` result. Run the restored healthy configuration and require `ok`,
    exit 0. Use a bash `EXIT` trap with existence-aware restoration (remove the test file only when
@@ -181,7 +181,7 @@ CHRONO_SESSION=2026-07-21c-d6-rust-port
 - Live collection observes the mandatory/best-effort sysfs rules, uses connected connector
   selection, treats multi-GPU/card ambiguity as exit 2, parses real gamescopectl output, performs
   zero writes to `modes.cfg` or `/sys/class/drm`, and invokes `gamescopectl` with no arguments.
-- The required .254 live replay is performed before merge, seeds the stated known line only after
+- The required live replay on the gaming host is performed before merge, seeds the stated known line only after
   preflight, observes degraded/0.85/exit-1 then restored ok/exit-0, and records an EXIT-trap and
   before/after SHA-256 restoration proof in the RESULT file.
 - `cargo fmt --check`, locked clippy with `-D warnings`, locked `cargo check`, locked `cargo test`,

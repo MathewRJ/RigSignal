@@ -8,7 +8,7 @@ CHRONO_SESSION=2026-07-16-elastic-agentic
 - Return only a condensed summary; detail goes in the RESULT file + STM.
 
 ## Context (validated live 2026-07-16)
-- eBPF SHIPPING is fixed (CA port merged 0f4658c, userspace deployed on GamingPC, zero flush
+- eBPF SHIPPING is fixed (CA port merged 0f4658c, userspace deployed on the gaming host, zero flush
   errors) but DOC PRODUCTION is zero. Prime suspect: probes ELF at
   `/usr/local/lib/rigsignal/rigsignal-ebpf-probes` on the box is the ORIGINAL bootstrap build —
   userspace/bytecode map-contract drift.
@@ -32,8 +32,8 @@ CHRONO_SESSION=2026-07-16-elastic-agentic
 4. Validate: `cargo check` (workspace) + existing tests. Do NOT touch manifest/pipeline/packaging
    files. Do NOT deploy anything to any box. Do NOT commit to main — commit on the worktree branch.
 5. Stage artifacts + sha256sums in the worktree under `deploy-staging/` and write a
-   deploy runbook `deploy-staging/DEPLOY.md`: exact scp/install commands for GamingPC
-   deck@192.168.50.254 (SteamOS: needs `sudo steamos-readonly disable` window, user-run;
+   deploy runbook `deploy-staging/DEPLOY.md`: exact scp/install commands for the gaming host
+   deck@192.0.2.254 (SteamOS: needs `sudo steamos-readonly disable` window, user-run;
    agent restart procedure as used for the 0.2.3 install; paired install of BOTH files;
    post-install check commands: journal grep for probe-load lines, GAME_PIDS seed warns gone).
 6. Write `tasks/ebpf-probes-rebuild.RESULT.md` (condensed: what changed, build versions used,
