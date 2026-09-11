@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated probes of blocked diagnostics and retained/redacted failure evidence."""
 import contextlib
+import errno
 import importlib.util
 import io
 import inspect
@@ -111,6 +112,103 @@ def worker(driver, case):
                         os.kill(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+        return
+    if case == 'pidfd-anchor':
+        # The identity anchor, asserted at the strength the evidence supports.
+        # Forced PID reuse is NOT reproduced here: the round-5 review tried and
+        # `unshare --user --map-root-user --pid --fork` was denied, so what is
+        # checked is that the anchor opens on the launcher, never re-points at a
+        # different identity across the reap, and that the reaped leader's group
+        # id answers ESRCH rather than reaching anything.
+        output = io.StringIO()
+        with patch.object(module.os, 'pidfd_open', side_effect=OSError(errno.ENOSYS, 'unavailable')), \
+                contextlib.redirect_stderr(output):
+            refused = module.preflight()
+        assert refused is False, 'preflight accepted a host without an identity anchor'
+        assert 'HARNESS SETUP: pidfd prerequisite' in output.getvalue(), output.getvalue()
+
+        child = subprocess.Popen(['sh', '-c', 'exit 7'], start_new_session=True)
+        pid = child.pid
+        fd = os.pidfd_open(pid)
+        def anchored():
+            for line in Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines():
+                if line.startswith('Pid:'):
+                    return int(line.split(':', 1)[1])
+            raise AssertionError('pidfd fdinfo carries no Pid field')
+        try:
+            assert anchored() == pid, 'anchor did not open on the launcher'
+            assert child.wait(timeout=0.1) == 7
+            # A recycled number would show a LIVE pid here. -1 is the kernel
+            # saying this identity is spent, which is the property relied on.
+            assert anchored() == -1, f'anchor followed another identity: {anchored()}'
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError('something holds the reaped leader group id')
+        finally:
+            os.close(fd)
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        print(f'PASS: anchor pinned {pid} across the reap; group id answers ESRCH')
+        return
+    if case == 'detached-expiry':
+        # The NAMED RESIDUAL, tested rather than described. A descendant that
+        # setsid()s away is outside the group terminate_group() reaches, and at an
+        # exhausted deadline there is no discovery budget to find it. What is
+        # required of the harness is not that it wins -- it is that it SAYS SO.
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'detached'
+            children, detached = [], []
+            try:
+                children.append(subprocess.Popen(
+                    ['sh', '-c', 'setsid sleep 100 & echo "$!" > "$1"; wait', 'sh', str(marker)],
+                    start_new_session=True))
+                limit = time.monotonic() + 0.1
+                while not marker.exists() and time.monotonic() < limit:
+                    time.sleep(0.001)
+                assert marker.exists(), 'fixture did not detach a descendant'
+                detached.append(int(marker.read_text()))
+                # Anti-vacuity: without these the case would pass on a fixture
+                # that never detached, because an exhausted deadline alone makes
+                # cleanup report failure.
+                assert alive(detached[0]), 'detached descendant was not running'
+                # The marker is published by the shell BEFORE setsid(2) has run,
+                # so wait for the session to actually change rather than assume
+                # it. A precondition wait, before any deadline exists.
+                limit = time.monotonic() + 0.1
+                while os.getsid(detached[0]) == os.getsid(children[0].pid) and time.monotonic() < limit:
+                    time.sleep(0.001)
+                assert os.getsid(detached[0]) != os.getsid(children[0].pid), 'descendant did not leave the session'
+                assert os.getpgid(detached[0]) != os.getpgid(children[0].pid), 'descendant did not leave the group'
+                deadline = time.monotonic() + 0.05
+                while time.monotonic() < deadline:
+                    time.sleep(min(0.001, max(0, deadline - time.monotonic())))
+                diagnostics = io.StringIO()
+                with contextlib.redirect_stderr(diagnostics):
+                    contained = module.cleanup(children[0], deadline)
+                assert contained is False, 'cleanup claimed success while a descendant survived'
+                assert 'HARNESS CLEANUP FAILURE' in diagnostics.getvalue(), diagnostics.getvalue()
+                assert alive(detached[0]), (
+                    'the detached descendant did NOT survive: containment improved, '
+                    'so the residual documented on terminate_group() is stale -- update it')
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        child.kill()
+                    child.wait()
+                for pid in detached:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        print('PASS: detached descendant survived final expiry and the harness said so')
         return
     if case == 'traversal':
         class GrowingTree:
@@ -225,6 +323,12 @@ def worker(driver, case):
             # Mocked pid: the group fallback must signal nothing real here,
             # rather than relying on pid_max to keep the id unallocatable.
             stack.enter_context(patch.object(module.os, 'killpg'))
+            # Same isolation for the identity anchor. The invented pid owns no
+            # real process to anchor, so stand in a real closeable descriptor
+            # rather than weaken run()'s refusal to proceed without one.
+            stack.enter_context(patch.object(
+                module.os, 'pidfd_open',
+                side_effect=lambda pid: os.open(os.devnull, os.O_RDONLY)))
             stack.enter_context(patch.object(module.os, 'waitpid', side_effect=ChildProcessError))
             stack.enter_context(patch.object(module, 'owned_pids', return_value={123456789} if case == 'status' else set()))
             stack.enter_context(patch.object(module.sys, 'argv', ['driver', 'INT']))
@@ -252,7 +356,7 @@ if __name__ == '__main__':
     if sys.argv[1] == '--worker':
         worker(sys.argv[2], sys.argv[3])
     else:
-        for case in sys.argv[2:] or ['fifo', 'status', 'output', 'result', 'traversal', 'output-fifo', 'result-fifo', 'stderr-full', 'real-expiry', 'expired-cleanup', 'partial-cleanup']:
+        for case in sys.argv[2:] or ['fifo', 'status', 'output', 'result', 'traversal', 'output-fifo', 'result-fifo', 'stderr-full', 'real-expiry', 'expired-cleanup', 'partial-cleanup', 'pidfd-anchor', 'detached-expiry']:
             result = subprocess.run([sys.executable, __file__, '--worker', sys.argv[1], case],
                                     capture_output=True, text=True, timeout=0.3)
             assert result.returncode == 0, result.stdout + result.stderr

@@ -49,18 +49,28 @@ def open_output(path, deadline):
 
 def preflight():
     """Required Linux coverage: unavailable containment is a setup failure."""
+    prerequisite = 'platform'
     try:
         if sys.platform != 'linux':
             raise OSError(errno.ENOSYS, 'Linux required')
+        prerequisite = 'prctl'
         libc = ctypes.CDLL(None, use_errno=True)
         if not hasattr(libc, 'prctl'):
             raise OSError(errno.ENOSYS, 'prctl unavailable')
         libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
         libc.prctl.restype = ctypes.c_int
+        prerequisite = 'subreaper'
         if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
             raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
+        # The identity anchor is a prerequisite, not an optimisation: without it
+        # terminate_group() targets a bare number that becomes recyclable the
+        # moment the launcher is reaped. Refuse, never fall back silently.
+        prerequisite = 'pidfd'
+        if not hasattr(os, 'pidfd_open'):
+            raise OSError(errno.ENOSYS, 'pidfd_open unavailable')
+        os.close(os.pidfd_open(os.getpid()))
     except OSError as error:
-        report(f'HARNESS SETUP: subreaper prerequisite errno={error.errno}')
+        report(f'HARNESS SETUP: {prerequisite} prerequisite errno={error.errno}')
         return False
     return True
 
@@ -162,14 +172,33 @@ def terminate_group(pid):
     run() spawns the launcher with start_new_session=True, so it leads a group
     whose id is its own pid and ordinary descendants inherit that group. One
     syscall, no /proc traversal and no deadline check, so this is still reachable
-    when the final deadline is exhausted and every scan below has failed. It does
-    not replace owned_pids(): a descendant that created its own session has left
-    the group.
+    when the final deadline is exhausted and every scan below has failed.
 
-    Safe for any pid the harness owns, because a group id is the pid of its
-    leader - killpg can therefore only reach a group led by that very process, or
-    nothing at all. The residual is pid reuse after the leader is reaped, which
-    the kernel defers while any member of the group is still alive.
+    CALLER CONTRACT: hold an identity anchor on pid across every call. run() opens
+    a pidfd immediately after spawning and closes it only after the last group
+    signal. A held pidfd keeps the struct pid referenced, so the kernel cannot
+    recycle that number; since a group id IS its leader's pid, no other process
+    can come to lead a group with this id. Without the anchor this signals a bare
+    number that is recyclable the instant the leader is reaped -- which happens on
+    the ORDINARY success path, where run() waits on the launcher before cleanup.
+    Forced reuse was not reproducible under the sandbox that found this (private
+    PID namespace setup was denied), so the anchor answers a static hazard.
+
+    REFUTED alternative, recorded so it is not re-proposed: "skip the group kill
+    once the leader is reaped and nothing is known" looks equivalent and is not.
+    A round-5 probe ran a real launcher that exited 17 and was reaped while an
+    ordinary child legitimately retained the killable group; at an exhausted
+    deadline `known` is empty there, so that guard would drop a kill that works.
+
+    NAMED RESIDUAL (accepted, not fixed): this cannot reach a descendant that
+    called setsid() or setpgid() -- it has left the group, and at an exhausted
+    deadline there is no discovery budget to find it. owned_pids() covers that
+    class whenever any time remains, which is why both paths exist. When neither
+    reaches it, cleanup() returns False and reports HARNESS CLEANUP FAILURE, so
+    the leak is loud rather than silent; the `detached-expiry` regression holds
+    that behaviour. Closing it needs a containment primitive the harness creates
+    before launch -- a per-case cgroup with a group-kill -- not another deadline
+    check, reserve or delayed observation, none of which can supply ownership.
     """
     if pid is None or pid <= 0 or pid == os.getpgrp():
         return
@@ -247,7 +276,11 @@ def run():
     with open_output(os.environ['RIGSIGNAL_ASSETS_SIGNAL_OUT'], work_deadline) as output:
         child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         known = set()
+        anchor = None
         try:
+            # Pin the launcher's identity before anything can reap it; see the
+            # caller contract on terminate_group().
+            anchor = os.pidfd_open(child.pid)
             while not os.path.exists(ready) and time.monotonic() < work_deadline:
                 time.sleep(min(0.01, max(0, work_deadline - time.monotonic())))
             if not os.path.exists(ready):
@@ -289,6 +322,9 @@ def run():
                 failed = True
             if failed and status is not None:
                 report(f'HARNESS FAILURE: launcher_status={status}')
+            if anchor is not None:
+                # Released only after the last group signal.
+                os.close(anchor)
     if failed:
         return 1
     try:
