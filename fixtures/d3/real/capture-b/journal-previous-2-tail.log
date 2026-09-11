@@ -710,7 +710,7 @@
 2026-07-21T08:49:16.680440+02:00 HOST-REDACTED-B NetworkManager[2042]: <info>  [1784616556.6804] device (enp6s0): state change: prepare -> config (reason 'none', managed-type: 'full')
 2026-07-21T08:49:16.687479+02:00 HOST-REDACTED-B NetworkManager[2042]: <info>  [1784616556.6874] device (enp6s0): state change: config -> ip-config (reason 'none', managed-type: 'full')
 2026-07-21T08:49:16.687747+02:00 HOST-REDACTED-B NetworkManager[2042]: <info>  [1784616556.6877] dhcp4 (enp6s0): activation: beginning transaction (timeout in 45 seconds)
-2026-07-21T08:49:16.688370+02:00 HOST-REDACTED-B avahi-daemon[1389]: Joining mDNS multicast group on interface enp6s0.IPv6 with address fe80::50c4:b556:fde4:185a.
+2026-07-21T08:49:16.688370+02:00 HOST-REDACTED-B avahi-daemon[1389]: Joining mDNS multicast group on interface enp6s0.IPv6 with address 2001:db8::1.
 2026-07-21T08:49:16.688397+02:00 HOST-REDACTED-B avahi-daemon[1389]: New relevant interface enp6s0.IPv6 for mDNS.
 2026-07-21T08:49:16.992340+02:00 HOST-REDACTED-B rtkit-daemon[2733]: Successfully made thread 4224 of process 4070 owned by '1000' high priority at nice level -10.
 2026-07-21T08:49:16.997531+02:00 HOST-REDACTED-B systemd[1]: Starting Daemon for power management...
@@ -1554,7 +1554,7 @@
 2026-07-21T10:56:52.682129+02:00 HOST-REDACTED-B systemd[1]: Unmounting /efi...
 2026-07-21T10:56:52.682262+02:00 HOST-REDACTED-B systemd[1]: Stopping Early OOM Daemon...
 2026-07-21T10:56:52.682373+02:00 HOST-REDACTED-B avahi-daemon[1389]: Got SIGTERM, quitting.
-2026-07-21T10:56:52.682415+02:00 HOST-REDACTED-B avahi-daemon[1389]: Leaving mDNS multicast group on interface enp6s0.IPv6 with address fe80::50c4:b556:fde4:185a.
+2026-07-21T10:56:52.682415+02:00 HOST-REDACTED-B avahi-daemon[1389]: Leaving mDNS multicast group on interface enp6s0.IPv6 with address 2001:db8::1.
 2026-07-21T10:56:52.682488+02:00 HOST-REDACTED-B systemd[1]: Stopping Avahi mDNS/DNS-SD Stack...
 2026-07-21T10:56:52.682498+02:00 HOST-REDACTED-B systemd[1]: cec-sysconf.service: Deactivated successfully.
 2026-07-21T10:56:52.682611+02:00 HOST-REDACTED-B systemd[1]: Stopped Hardware Specific CEC Configuration.

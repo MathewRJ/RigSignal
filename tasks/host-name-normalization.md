@@ -8,7 +8,7 @@ CHRONO_SESSION=2026-07-21-deploy-valve-d6
 - Return only a condensed summary; detail goes in the RESULT file + STM.
 
 ## Context
-- Known data bug: `host.name` case split in ES — the eBPF daemon emits `GamingPC` (reads
+- Known data bug: `host.name` case split in ES — the eBPF daemon emits `Fixture-PEER.EXAMPLE` (reads
   `/etc/hostname` raw at `ebpf/rigsignal-ebpf/src/main.rs:96`, hostinfo in
   `ebpf/rigsignal-ebpf/src/es_model.rs`), while the userspace agent emits lowercase
   (`src/host.rs::hostname()` reading `/proc/sys/kernel/hostname`; Windows path reads

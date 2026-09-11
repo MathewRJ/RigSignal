@@ -176,7 +176,7 @@
 2026-07-20T19:41:43.501417+02:00 HOST-REDACTED-B mangoapp[2428]: [2026-07-20 19:41:43.501] [MANGOHUD] [error] [overlay_params.cpp:758] Unknown option 'nis_steam_sharpness'
 2026-07-20T19:41:43.508747+02:00 HOST-REDACTED-B NetworkManager[1878]: <info>  [1784569303.5087] device (enp6s0): state change: config -> ip-config (reason 'none', managed-type: 'full')
 2026-07-20T19:41:43.509059+02:00 HOST-REDACTED-B NetworkManager[1878]: <info>  [1784569303.5090] dhcp4 (enp6s0): activation: beginning transaction (timeout in 45 seconds)
-2026-07-20T19:41:43.509475+02:00 HOST-REDACTED-B avahi-daemon[1457]: Joining mDNS multicast group on interface enp6s0.IPv6 with address fe80::50c4:b556:fde4:185a.
+2026-07-20T19:41:43.509475+02:00 HOST-REDACTED-B avahi-daemon[1457]: Joining mDNS multicast group on interface enp6s0.IPv6 with address 2001:db8::1.
 2026-07-20T19:41:43.509498+02:00 HOST-REDACTED-B avahi-daemon[1457]: New relevant interface enp6s0.IPv6 for mDNS.
 2026-07-20T19:41:43.537197+02:00 HOST-REDACTED-B NetworkManager[1878]: <info>  [1784569303.5371] dhcp4 (enp6s0): state changed new lease, address=IP-REDACTED, acd pending
 2026-07-20T19:41:43.542170+02:00 HOST-REDACTED-B systemd[2096]: Starting Accessibility services bus...
@@ -1559,7 +1559,7 @@
 2026-07-20T23:01:44.938079+02:00 HOST-REDACTED-B systemd[1]: Unmounting /efi...
 2026-07-20T23:01:44.938255+02:00 HOST-REDACTED-B systemd[1]: Stopping Early OOM Daemon...
 2026-07-20T23:01:44.938327+02:00 HOST-REDACTED-B avahi-daemon[1457]: Got SIGTERM, quitting.
-2026-07-20T23:01:44.938362+02:00 HOST-REDACTED-B avahi-daemon[1457]: Leaving mDNS multicast group on interface enp6s0.IPv6 with address fe80::50c4:b556:fde4:185a.
+2026-07-20T23:01:44.938362+02:00 HOST-REDACTED-B avahi-daemon[1457]: Leaving mDNS multicast group on interface enp6s0.IPv6 with address 2001:db8::1.
 2026-07-20T23:01:44.938477+02:00 HOST-REDACTED-B avahi-daemon[1457]: Leaving mDNS multicast group on interface enp6s0.IPv4 with address IP-REDACTED.
 2026-07-20T23:01:44.938617+02:00 HOST-REDACTED-B avahi-daemon[1457]: Leaving mDNS multicast group on interface lo.IPv6 with address ::1.
 2026-07-20T23:01:44.938630+02:00 HOST-REDACTED-B avahi-daemon[1457]: Leaving mDNS multicast group on interface lo.IPv4 with address 127.0.0.1.

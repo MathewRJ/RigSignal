@@ -243,7 +243,7 @@ The previous state is **the 0.3.0-era production asset state, minimally adapted
 to boot on a Fleet-free clean stack**. This is the honest previous version until
 0.3.1 ships a real bundle (Amendment 1 / Sol F5: never install-current-twice).
 Fixtures keep production structure, use lowercase host.name
-rigsignal-matrix-host, and receive timestamp at ingest. CPU marker
+fixture-host.example, and receive timestamp at ingest. CPU marker
 rigsignal.cpu.total_utilisation_pct=42.25 and the connected events value are
 exact asserts. Browser-visual verification is a known limitation deferred to the
 app/kiosk design task. TK-4 publishes a range only after every mode passes both

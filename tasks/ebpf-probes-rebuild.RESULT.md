@@ -36,7 +36,7 @@ post-install checks. No remote action was performed.
 
 ## Drift confirmation
 
-The task's live handoff/STM records that GamingPC has the original bootstrap
+The task's live handoff/STM records that the gaming host has the original bootstrap
 probe ELF at `/usr/local/lib/rigsignal/rigsignal-ebpf-probes`, while the
 userspace daemon was later rebuilt and deployed; that is the expected
 bytecode/userspace map-contract drift. Per the amendment, all Git operations

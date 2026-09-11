@@ -24,7 +24,7 @@ fixture paths.
 
 ## Live-replay verification (orchestrator-run, 2026-07-21, PASS)
 
-Performed on GamingPC `deck@192.168.50.254` via
+Performed on the gaming host `deck@192.0.2.254` via
 `Workflow projects/RigSignal/scripts/d6-live-replay.sh` (EXIT-trap, existence-aware
 restore). Full transcript:
 `Workflow projects/RigSignal/evidence/d6-live-replay-2026-07-21/d6-live-replay-20260721T170204.log`.
