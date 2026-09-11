@@ -537,26 +537,50 @@ assets_cleanup() {
 assets_interrupted() {
     _assets_signal_status=$?
     _assets_signal=${1:-TERM}
-    # Keep this trap active until the first cleanup has completed.  Returning
-    # here lets the original cleanup finish if another signal arrives mid-rm.
     [ "${ASSETS_CLEANING:-0}" = "1" ] && return 0
-    # wait is interrupted before the child has necessarily received HUP/INT.
-    # Forward the same signal, then wait for that real child status before any
-    # cleanup command (or a second trap) can overwrite it.
+    # This handler owns cancellation and reaping. In dash a trapped signal
+    # interrupts wait without reaping the child; that first status is not the
+    # engine status. Disable reentry before forwarding or waiting again.
+    trap '' HUP INT TERM
+    # Preserve a completed ordinary wait before starting any background job:
+    # dash can discard its cached status when the watchdog is spawned.
+    if [ -n "${ASSETS_ENGINE_PID:-}" ] && ! kill -0 "$ASSETS_ENGINE_PID" 2>/dev/null; then
+        if [ -z "${ASSETS_ENGINE_STATUS+x}" ]; then
+            set +e
+            wait "$ASSETS_ENGINE_PID"
+            ASSETS_ENGINE_STATUS=$?
+        fi
+        ASSETS_ENGINE_PID=""
+    fi
     if [ -n "${ASSETS_ENGINE_PID:-}" ]; then
+        # Async children inherit ignored INT, so INT does not cancel the
+        # background engine. Bound cancellation with a child-only watchdog.
+        # Use one process (no sleep children) that the parent can reap.
+        python3 - "$ASSETS_ENGINE_PID" <<'PYEOF' &
+import os, signal, sys, time
+pid = int(sys.argv[1])
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    time.sleep(2)
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        break
+PYEOF
+        ASSETS_WATCHDOG_PID=$!
         kill -"$_assets_signal" "$ASSETS_ENGINE_PID" 2>/dev/null || true
         set +e
         wait "$ASSETS_ENGINE_PID"
         ASSETS_ENGINE_STATUS=$?
-        set -e
+        # KILL also works before the watchdog interpreter initializes, with
+        # the ignored signal dispositions inherited from this handler.
+        kill -KILL "$ASSETS_WATCHDOG_PID" 2>/dev/null || true
+        wait "$ASSETS_WATCHDOG_PID" 2>/dev/null
+        ASSETS_WATCHDOG_PID=""
         ASSETS_ENGINE_PID=""
+        set -e
     else
         [ -n "${ASSETS_ENGINE_STATUS+x}" ] || ASSETS_ENGINE_STATUS=$_assets_signal_status
     fi
-    # Cleanup is deliberately non-reentrant.  Ignore a second delivery while
-    # it runs so that its trap status cannot replace the status just captured
-    # from the engine (and so it cannot interrupt credential/terminal cleanup).
-    trap '' HUP INT TERM
     assets_cleanup "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
     trap - EXIT HUP INT TERM
     exit "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
@@ -972,9 +996,8 @@ PY
     if [ "$ASSETS_REPAIR" = 1 ]; then set -- --repair; else set --; fi
     [ "$ASSETS_UPGRADE" = 0 ] || set -- "$@" --upgrade
     [ "$ASSETS_ALLOW_DOWNGRADE" = 0 ] || set -- "$@" --allow-downgrade
-    # A background child lets the trap forward HUP/INT/TERM and wait for the
-    # child's real status.  In the ordinary path wait's status is captured
-    # immediately, while errexit is disabled, before cleanup can run.
+    # On a signal the cancellation handler owns reaping and exits; this
+    # ordinary wait path is only resumed when no cancellation was handled.
     set +e
     python3 "$ASSETS_ENGINE/install_assets.py" --assets-only --profile user --ownership-profile default \
         --bundle "$ASSETS_BUNDLE_SNAPSHOT" --endpoint "$ASSETS_ENDPOINT" --ca-file "$CA_SNAPSHOT" \

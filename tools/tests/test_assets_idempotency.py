@@ -1957,6 +1957,18 @@ time.sleep(60)
 
     def test_t_exit_4_real_cli_and_launcher_wait_status_anchor(self):
         """The packaged launcher subprocess preserves all engine contract codes."""
+        # The flag-row fan-out partitions ROWS, not test methods: each of its 8
+        # child interpreters rediscovers this whole module, so every test without
+        # a shard guard runs nine times, eight of them concurrently.  The launcher
+        # suite below reaps real processes against real deadlines, and running it
+        # nine times at once makes its timing assertions fail on whichever case
+        # each worker happens to reach first -- observed in CI on stderr-full,
+        # expired-cleanup, fifo, status and real-expiry across the eight shards.
+        # Run it once, in the parent.  Central ruling 2026-09-11 (option A): fix
+        # the replication, never the bounds -- no deadline, timeout or dispatcher
+        # budget may move to accommodate contention the suite should not be under.
+        if os.environ.get("RIGSIGNAL_FLAG_WORKER") == "1":
+            self.skipTest("launcher suite runs once in the fan-out parent, not per shard worker")
         cli = subprocess.run([sys.executable, str(ROOT / "tools/install_assets.py"), "--unknown-flag"],
                              text=True, capture_output=True, check=False, timeout=600)
         self.assertEqual(cli.returncode, 2)

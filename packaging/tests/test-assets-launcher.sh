@@ -5,6 +5,9 @@ repo_dir=$(dirname "$0")/../..
 repo=$(cd "$repo_dir"; pwd)
 launcher="$repo/packaging/rigsignal-launcher.sh"
 corpus="$repo/packaging/tests/sidecar-verifier-corpus.tsv"
+python3 "$repo/packaging/tests/test-assets-signal-boundary.py" "$launcher"
+python3 "$repo/packaging/tests/test-assets-signal-driver.py" "$repo/packaging/tests/assets-signal-driver.py"
+python3 "$repo/packaging/tests/test-assets-signal-reporting.py" "$repo/packaging/tests/assets-signal-driver.py"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 home="$tmp/home"; bin="$home/.local/bin"; engine="$home/.local/lib/rigsignal/engine"
@@ -255,38 +258,72 @@ write_signal_engine() {
         'while True: time.sleep(1)' >"$engine/install_assets.py"
     chmod 755 "$engine/install_assets.py"
 }
-signal_driver="$tmp/signal-driver.py"
-printf '%s\n' '#!/usr/bin/env python3' \
-    'import os, signal, subprocess, sys, time' \
-    'signal_name = sys.argv[1]' \
-    'ready, result = os.environ["RIGSIGNAL_ASSETS_SIGNAL_READY"], os.environ["RIGSIGNAL_ASSETS_SIGNAL_RESULT"]' \
-    'command = [os.environ["RIGSIGNAL_ASSETS_LAUNCHER"], "assets", "install", "--bundle", os.environ["RIGSIGNAL_ASSETS_BUNDLE"], "--endpoint", "http://127.0.0.1:9200", "--ca-file", os.environ["RIGSIGNAL_ASSETS_CA"], "--kibana-endpoint", "https://kibana.example.invalid", "--admin-credentials-file", os.environ["RIGSIGNAL_ASSETS_CREDENTIALS"], "--non-interactive"]' \
-    'with open(os.environ["RIGSIGNAL_ASSETS_SIGNAL_OUT"], "w", encoding="utf-8") as output:' \
-    '    child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)' \
-    '    deadline = time.monotonic() + float(os.environ.get("RIGSIGNAL_LAUNCHER_WAIT_SECS", "60"))' \
-    '    while not os.path.exists(ready) and time.monotonic() < deadline: time.sleep(0.05)' \
-    '    if not os.path.exists(ready): child.kill(); child.wait(); raise SystemExit("engine did not become ready")' \
-    '    os.kill(child.pid, getattr(signal, "SIG" + signal_name))' \
-    '    status = child.wait(timeout=float(os.environ.get("RIGSIGNAL_LAUNCHER_WAIT_SECS", "60")))' \
-    'open(result, "w", encoding="utf-8").write(f"status={status}\n")' >"$signal_driver"
-chmod 755 "$signal_driver"
+signal_driver="$repo/packaging/tests/assets-signal-driver.py"
+export RIGSIGNAL_ASSETS_TEST_SCRIPT="$repo/packaging/tests/test-assets-launcher.sh"
+export RIGSIGNAL_ASSETS_FIXTURE="$engine/install_assets.py"
 
 # The launcher must forward every supported signal to the engine, then return
 # the engine's actual status rather than a trap/cleanup status.
 run_signal_status_case() {
-    local signal_name ready seen result
+    local signal_name ready seen result case_name expected_status expected_signal
     signal_name=$1
-    ready="$tmp/$signal_name.ready"
-    seen="$tmp/$signal_name.seen"
+    case_name=${2:-$signal_name}
+    expected_status=${3:-42}
+    expected_signal=${4:-SIG$signal_name}
+    ready="$tmp/$case_name.ready"
+    seen="$tmp/$case_name.seen"
     rm -f "$ready" "$seen"
     write_signal_engine
-    result="$tmp/$signal_name.result"
+    case "$case_name" in
+        inherited-int-reproducer|repeated-int-hardening|ignore-hup-hardening|ignore-term-hardening)
+            # Preserve the async child's inherited SIG_IGN for INT.
+            sed -i 's/(signal.SIGHUP, signal.SIGINT, signal.SIGTERM)/(signal.SIGHUP, signal.SIGTERM)/' "$engine/install_assets.py"
+            ;;
+    esac
+    case "$case_name" in
+        ignore-hup-hardening) sed -i '/open(os.environ\["RIGSIGNAL_ASSETS_SIGNAL_READY"\]/i signal.signal(signal.SIGHUP, signal.SIG_IGN)' "$engine/install_assets.py" ;;
+        ignore-term-hardening) sed -i '/open(os.environ\["RIGSIGNAL_ASSETS_SIGNAL_READY"\]/i signal.signal(signal.SIGTERM, signal.SIG_IGN)' "$engine/install_assets.py" ;;
+    esac
+    result="$tmp/$case_name.result"
     rm -f "$result"
-    HOME="$home" XDG_CONFIG_HOME="$home/.config" TMPDIR="$tmp/runtime" RIGSIGNAL_ASSETS_TEST_ARGS="$args" RIGSIGNAL_ASSETS_TEST_CREDENTIAL="$credential_probe" RIGSIGNAL_ASSETS_SIGNAL_READY="$ready" RIGSIGNAL_ASSETS_SIGNAL_SEEN="$seen" RIGSIGNAL_ASSETS_SIGNAL_RESULT="$result" RIGSIGNAL_ASSETS_SIGNAL_OUT="$tmp/$signal_name.out" RIGSIGNAL_ASSETS_LAUNCHER="$bin/rigsignal" RIGSIGNAL_ASSETS_BUNDLE="$bundle" RIGSIGNAL_ASSETS_CA="$ca" RIGSIGNAL_ASSETS_CREDENTIALS="$credentials" python3 "$signal_driver" "$signal_name"
-    require_line status=42 "$result" "$signal_name preserved engine status"
-    require_line "SIG$signal_name" "$seen" "$signal_name was not forwarded to the engine"
+    HOME="$home" XDG_CONFIG_HOME="$home/.config" TMPDIR="$tmp/runtime" RIGSIGNAL_ASSETS_TEST_ARGS="$args" RIGSIGNAL_ASSETS_TEST_CREDENTIAL="$credential_probe" RIGSIGNAL_ASSETS_SIGNAL_READY="$ready" RIGSIGNAL_ASSETS_SIGNAL_SEEN="$seen" RIGSIGNAL_ASSETS_SIGNAL_RESULT="$result" RIGSIGNAL_ASSETS_SIGNAL_OUT="$tmp/$signal_name.out" RIGSIGNAL_ASSETS_LAUNCHER="$bin/rigsignal" RIGSIGNAL_ASSETS_BUNDLE="$bundle" RIGSIGNAL_ASSETS_CA="$ca" RIGSIGNAL_ASSETS_CREDENTIALS="$credentials" python3 "$signal_driver" "$signal_name" || return $?
+    require_line "status=$expected_status" "$result" "$case_name preserved engine status"
+    if [ "$expected_signal" = absent ]; then
+        if [ -e "$seen" ]; then fail "$case_name unexpectedly acknowledged a signal"; fi
+    else
+        require_line "$expected_signal" "$seen" "$case_name engine acknowledgement"
+    fi
     require_missing_match "$tmp/runtime" 'rigsignal-assets.*' "$signal_name cleanup left the private assets directory"
+    printf 'PASS: %s status=%s acknowledgement=%s\n' "$case_name" "$expected_status" "$expected_signal"
 }
+# Faithful reproduction: INT stays inherited SIG_IGN; TERM escalation is
+# acknowledged with exit 42.
+run_signal_status_case INT inherited-int-reproducer 42 SIGTERM
+# Hardening is separate from the inherited-INT production reproducer.
+# A second INT must not interrupt parent reaping.
+RIGSIGNAL_ASSETS_REPEAT_SIGNAL=1 run_signal_status_case INT repeated-int-hardening 42 SIGTERM
+run_signal_status_case HUP ignore-hup-hardening 42 SIGTERM
+run_signal_status_case INT ignore-term-hardening 137 absent
+
+# Prove finally on TimeoutExpired, including when capture itself fails.
+for failure in timeout capture; do
+    set +e
+    RIGSIGNAL_ASSETS_HARNESS_FAILURE="$failure" run_signal_status_case INT "harness-$failure" >"$tmp/harness-$failure.log" 2>&1
+    failure_status=$?
+    set -e
+    require_status 1 "$failure_status" "harness $failure must fail"
+    require_grep TimeoutExpired "$tmp/harness-$failure.log" "timeout was not re-raised"
+    require_grep 'FINALLY process group absent' "$tmp/harness-$failure.log" "finally did not clean the process group"
+    require_grep 'descendants=\[[0-9]' "$tmp/harness-$failure.log" "finally did not reap the orphan engine"
+    require_grep 'sha256 ' "$tmp/harness-$failure.log" "timeout hashes missing"
+    require_grep SigBlk "$tmp/harness-$failure.log" "timeout signal masks missing"
+    if [ "$failure" = capture ]; then
+        require_grep 'capture failed:.*injected capture failure' "$tmp/harness-$failure.log" "capture failure was not exercised"
+    fi
+    printf 'PASS: harness-%s exit=%s; finally reaped descendants and removed group\n' "$failure" "$failure_status"
+    # Failed launcher cannot clean its credentials after SIGKILL.
+    rm -rf "$tmp/runtime"/rigsignal-assets.*
+done
 run_signal_status_case HUP
 run_signal_status_case INT
 run_signal_status_case TERM
