@@ -21,3 +21,5 @@ jobs:
           id
       - name: Measure cgroup delegation
         run: python3 packaging/tests/probe-cgroup-delegation.py
+      - name: Probe ELEVATED (informational only, NOT a fallback)
+        run: sudo python3 packaging/tests/probe-cgroup-delegation.py

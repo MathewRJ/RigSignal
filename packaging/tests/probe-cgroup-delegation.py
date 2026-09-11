@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Diagnostic only: measure cgroup v2 containment, never configure delegation."""
 
+# KNOWN LIMITS (accepted):
+# NO_DELEGATION means no mkdir via own / parent / root; other writable delegated
+# ancestors are not tried. Carriage returns in cgroup names mis-parse.
+# The first successful mkdir is not reconsidered after placement fails (PROBE_ERROR).
+# Interrupts between mkdir and registration can leak the unregistered cgroup.
+
 import errno
 import os
 from pathlib import Path
@@ -41,7 +47,7 @@ def evidence(phase, name, current, original=None):
         values['state'] = 'ABSENT'
     identity = ''
     if original is not None:
-        same = current is not None and current['starttime'] == original['starttime']
+        same = same_identity(current, original)
         identity = (' identity=SURVIVED' if same else ' identity=GONE')
         identity += f" anchor_starttime={original['starttime']}"
     print(f"{phase}: {name} " + ' '.join(f'{k}={values[k]}' for k in FIELDS)
@@ -49,7 +55,8 @@ def evidence(phase, name, current, original=None):
 
 
 def same_identity(current, original):
-    return current is not None and current['starttime'] == original['starttime']
+    return (current is not None and current['starttime'] == original['starttime']
+            and current['state'] != 'Z')
 
 
 def timeout_handler(signum, frame):
@@ -98,15 +105,18 @@ class Probe:
         if 'cgroup.kill' not in os.listdir(self.cgroup):
             return 'NO_CGROUP_KILL'
 
-        for name in ('setsid', 'setpgid', 'control'):
+        for name in ('setsid', 'setpgid', 'control', 'pgroup-control'):
             options = ({'preexec_fn': os.setpgrp} if name == 'setpgid'
                        else {'start_new_session': True})
+            if name == 'pgroup-control':
+                target_pgid = os.getpgid(self.children['setpgid'].pid)
+                options = {'preexec_fn': lambda: os.setpgid(0, target_pgid)}
             proc = subprocess.Popen(
                 [sys.executable, '-c', 'import time; time.sleep(60)', f'rsprobe-{name}'],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, **options)
             self.children[name] = proc
-            if name != 'control':
+            if name in ('setsid', 'setpgid'):
                 (self.cgroup / 'cgroup.procs').write_text(str(proc.pid))
 
         before = {name: snapshot(proc.pid) for name, proc in self.children.items()}
@@ -120,16 +130,30 @@ class Probe:
         require(before['setsid']['sid'] != os.getsid(0), 'clause 1: setsid not detached')
         require(before['setpgid']['pgid'] != os.getpgrp(), 'clause 1: setpgid not detached')
         require(before['control']['sid'] != os.getsid(0), 'clause 4: control not detached')
+        require(before['pgroup-control']['pgid'] == before['setpgid']['pgid'],
+                'clause 4: pgroup-control does not share setpgid target process group')
         members_text = (self.cgroup / 'cgroup.procs').read_text()
         print(f'CGROUP-PROCS-BEFORE: {members_text.split()}', flush=True)
         members = {int(pid) for pid in members_text.split()}
         for name in ('setsid', 'setpgid'):
             require(before[name]['pid'] in members, f'clause 2: {name} missing from cgroup.procs')
         require(os.getpid() not in members, 'probe is inside kill cgroup')
-        require(before['control']['pid'] not in members, 'clause 4: control inside cgroup')
+        for name in ('control', 'pgroup-control'):
+            require(before[name]['pid'] not in members, f'clause 4: {name} inside cgroup')
 
         # No signals or process-group kills until all post-kill evidence is captured.
-        (self.cgroup / 'cgroup.kill').write_bytes(b'1')
+        for name in ('setsid', 'setpgid'):
+            current = snapshot(self.children[name].pid)
+            require(same_identity(current, before[name]),
+                    f'clause 1b: {name} died before the kill')
+            evidence('CLAUSE-1B', name, current, before[name])
+        try:
+            written = (self.cgroup / 'cgroup.kill').write_bytes(b'1')
+        except OSError as exc:
+            raise RuntimeError(f'cgroup.kill write failed errno='
+                               f'{errno.errorcode.get(exc.errno, exc.errno)}') from exc
+        require(written == 1, f'cgroup.kill short write: {written} bytes')
+        print('KILL-WRITE: cgroup.kill bytes=1 errno=0 success=True', flush=True)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             # Reap direct children so zombies do not masquerade as survivors.
@@ -139,12 +163,15 @@ class Probe:
                    for name in ('setsid', 'setpgid')):
                 break
             time.sleep(0.02)
+        # Poll once more after the deadline before taking fresh final snapshots.
+        for proc in self.children.values():
+            proc.poll()
         after = {name: snapshot(proc.pid) for name, proc in self.children.items()}
         for name, row in after.items():
             evidence('AFTER', name, row, before[name])
-        require(same_identity(after['control'], before['control'])
-                and after['control']['state'] != 'Z',
-                'clause 4: out-of-cgroup control did not survive')
+        for name in ('control', 'pgroup-control'):
+            require(same_identity(after[name], before[name]),
+                    f'clause 4: out-of-cgroup {name} did not survive')
         if any(same_identity(after[name], before[name]) for name in ('setsid', 'setpgid')):
             return 'KILL_INEFFECTIVE'
         return 'AVAILABLE'
