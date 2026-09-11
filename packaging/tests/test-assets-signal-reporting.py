@@ -14,46 +14,89 @@ import tempfile
 from unittest.mock import patch
 
 
+def alive(pid):
+    """Liveness from /proc/<pid>/stat, never from an exception class.
+
+    comm is the only field that may contain spaces or parens, so the state
+    character is the first field after the final ') '. A zombie has been
+    killed and is awaiting a reap: it is not a surviving process.
+    """
+    try:
+        record = Path(f'/proc/{pid}/stat').read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return record.rsplit(') ', 1)[1].split(' ', 1)[0] != 'Z'
+
+
 def worker(driver, case):
     spec = importlib.util.spec_from_file_location('driver', driver)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if case in ('expired-cleanup', 'partial-cleanup'):
-        children = [subprocess.Popen(['sleep', '100']) for _ in range(2 if case == 'partial-cleanup' else 1)]
-        try:
-            deadline = time.monotonic() + 0.05
-            with contextlib.ExitStack() as stack:
-                if case == 'expired-cleanup':
-                    # Exhaust real time, rather than injecting TimeoutExpired.
-                    while time.monotonic() < deadline:
-                        time.sleep(min(0.001, max(0, deadline - time.monotonic())))
-                else:
-                    read = module.bounded_read
-                    calls = 0
-                    def incomplete(path, bound, *args):
-                        nonlocal calls
-                        calls += 1
-                        if calls > 1:
-                            raise module.DiagnosticIncomplete()
-                        return read(path, bound, *args)
-                    stack.enter_context(patch.object(module, 'bounded_read', side_effect=incomplete))
-                try:
-                    module.cleanup(children[0], deadline)
-                except module.DiagnosticIncomplete:
-                    pass
-            # Allow the kernel to deliver kills; the assertion is liveness.
-            for child in children:
-                try:
-                    child.wait(timeout=0.05)
-                except subprocess.TimeoutExpired:
-                    pass
-            survivors = [child.pid for child in children if child.poll() is None]
-            assert not survivors, f'SURVIVING PROCESSES: {survivors}'
-        finally:
-            for child in children:
-                if child.poll() is None:
-                    child.kill()
-                child.wait()
+        descendants = []
+        with tempfile.TemporaryDirectory() as directory:
+            if case == 'expired-cleanup':
+                # A launcher in its own session with its own child, because the
+                # single-sleep shape admitted termination of the known PID while
+                # an undiscovered descendant survived. start_new_session mirrors
+                # run(), so the launcher leads the group the harness created.
+                marker = Path(directory) / 'descendant'
+                children = [subprocess.Popen(
+                    ['sh', '-c', 'sleep 100 & echo "$!" > "$1"; wait', 'sh', str(marker)],
+                    start_new_session=True)]
+                limit = time.monotonic() + 0.1
+                while not marker.exists() and time.monotonic() < limit:
+                    time.sleep(0.001)
+                assert marker.exists(), 'fixture did not start its descendant'
+                descendants.append(int(marker.read_text()))
+            else:
+                children = [subprocess.Popen(['sleep', '100']) for _ in range(2)]
+            try:
+                deadline = time.monotonic() + 0.05
+                with contextlib.ExitStack() as stack:
+                    if case == 'expired-cleanup':
+                        # Exhaust real time, rather than injecting TimeoutExpired.
+                        while time.monotonic() < deadline:
+                            time.sleep(min(0.001, max(0, deadline - time.monotonic())))
+                    else:
+                        read = module.bounded_read
+                        calls = 0
+                        def incomplete(path, bound, *args):
+                            nonlocal calls
+                            calls += 1
+                            if calls > 1:
+                                raise module.DiagnosticIncomplete()
+                            return read(path, bound, *args)
+                        stack.enter_context(patch.object(module, 'bounded_read', side_effect=incomplete))
+                    try:
+                        module.cleanup(children[0], deadline)
+                    except module.DiagnosticIncomplete:
+                        pass
+                # Allow the kernel to deliver kills; the assertion is liveness.
+                for child in children:
+                    try:
+                        child.wait(timeout=0.05)
+                    except subprocess.TimeoutExpired:
+                        pass
+                # A descendant is not ours to wait() on, so settle on a bound.
+                # This cannot mask the defect it guards: an unsignalled child of
+                # this fixture sleeps 100s, so it is alive at any bound.
+                limit = time.monotonic() + 0.05
+                while any(map(alive, descendants)) and time.monotonic() < limit:
+                    time.sleep(0.001)
+                survivors = [pid for pid in [child.pid for child in children] + descendants
+                             if alive(pid)]
+                assert not survivors, f'SURVIVING PROCESSES: {survivors}'
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait()
+                for pid in descendants:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
         return
     if case == 'traversal':
         class GrowingTree:
@@ -165,6 +208,9 @@ def worker(driver, case):
             stack.enter_context(patch.object(module, 'preflight', return_value=True))
             stack.enter_context(patch.object(module.subprocess, 'Popen', return_value=Child()))
             stack.enter_context(patch.object(module.os, 'kill'))
+            # Mocked pid: the group fallback must signal nothing real here,
+            # rather than relying on pid_max to keep the id unallocatable.
+            stack.enter_context(patch.object(module.os, 'killpg'))
             stack.enter_context(patch.object(module.os, 'waitpid', side_effect=ChildProcessError))
             stack.enter_context(patch.object(module, 'owned_pids', return_value={123456789} if case == 'status' else set()))
             stack.enter_context(patch.object(module.sys, 'argv', ['driver', 'INT']))

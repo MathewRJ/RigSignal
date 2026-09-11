@@ -156,6 +156,29 @@ def capture(child, deadline, known=None):
         raise RuntimeError('injected capture failure')
 
 
+def terminate_group(pid):
+    """Terminate the process group led by pid, without spending discovery time.
+
+    run() spawns the launcher with start_new_session=True, so it leads a group
+    whose id is its own pid and ordinary descendants inherit that group. One
+    syscall, no /proc traversal and no deadline check, so this is still reachable
+    when the final deadline is exhausted and every scan below has failed. It does
+    not replace owned_pids(): a descendant that created its own session has left
+    the group.
+
+    Safe for any pid the harness owns, because a group id is the pid of its
+    leader - killpg can therefore only reach a group led by that very process, or
+    nothing at all. The residual is pid reuse after the leader is reaped, which
+    the kernel defers while any member of the group is still alive.
+    """
+    if pid is None or pid <= 0 or pid == os.getpgrp():
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def cleanup(child, deadline, known=None):
     reaped = []
     known = set() if known is None else known
@@ -163,6 +186,9 @@ def cleanup(child, deadline, known=None):
         known.add(child.pid)
     incomplete = False
     while True:
+        # Containment must not depend on remaining time: an exhausted deadline
+        # fails every scan below, leaving known = {launcher} and its child alive.
+        terminate_group(child.pid)
         # Killing known ownership must precede (and survive) a failed scan.
         for pid in known:
             try:
