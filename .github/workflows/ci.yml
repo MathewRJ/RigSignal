@@ -60,55 +60,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # DIAGNOSTIC ONLY, no behaviour depends on it. Authorised by Central
-      # 2026-09-11 to establish the runner kernel, after a round-6 review
-      # falsified an inferred kernel claim by construction: a held pidfd does
-      # NOT reserve the pid number (free_pid removes the IDR entry before the
-      # reference release), so a numeric killpg can reach a recycled group.
-      # The replacement is identity-based group signalling, which needs
-      # PIDFD_SIGNAL_PROCESS_GROUP (Linux 6.9+). This PROBES the flag rather
-      # than inferring support from a version string -- inferring is the exact
-      # error that produced this step. Remove once the answer is recorded.
-      - name: Diagnostic - runner kernel and pidfd group-signal support
-        run: |
-          uname -r
-          python3 - <<'PROBE'
-          import ctypes, os, signal, subprocess, sys, time
-          PIDFD_SIGNAL_PROCESS_GROUP, SYS_pidfd_send_signal = 4, 424
-          libc = ctypes.CDLL(None, use_errno=True)
-          print('kernel:', os.uname().release)
-          if not hasattr(os, 'pidfd_open'):
-              print('RESULT: pidfd_open UNAVAILABLE'); sys.exit(0)
-          child = subprocess.Popen(['sh', '-c', 'sleep 30 & echo "$!" > pg.pid; wait'],
-                                   start_new_session=True)
-          fd = os.pidfd_open(child.pid)
-          limit = time.monotonic() + 5
-          while not os.path.exists('pg.pid') and time.monotonic() < limit:
-              time.sleep(0.005)
-          grandchild = int(open('pg.pid').read())
-          print('launcher', child.pid, 'grandchild', grandchild,
-                'same pgid:', os.getpgid(child.pid) == os.getpgid(grandchild))
-          ctypes.set_errno(0)
-          rc = libc.syscall(SYS_pidfd_send_signal, ctypes.c_int(fd),
-                            ctypes.c_int(signal.SIGKILL), None,
-                            ctypes.c_uint(PIDFD_SIGNAL_PROCESS_GROUP))
-          err = ctypes.get_errno()
-          print('pidfd_send_signal(PROCESS_GROUP) rc=%d errno=%d' % (rc, err))
-          time.sleep(0.2)
-          def alive(pid):
-              try:
-                  return open('/proc/%d/stat' % pid).read().rsplit(') ', 1)[1].split(' ', 1)[0] != 'Z'
-              except FileNotFoundError:
-                  return False
-          print('after: launcher alive=%s grandchild alive=%s' % (alive(child.pid), alive(grandchild)))
-          print('RESULT: PIDFD_SIGNAL_PROCESS_GROUP',
-                'SUPPORTED' if rc == 0 else 'UNSUPPORTED errno=%d' % err)
-          for killer, target in ((os.killpg, child.pid), (os.kill, grandchild)):
-              try: killer(target, signal.SIGKILL)
-              except OSError: pass
-          child.wait(); os.close(fd)
-          PROBE
-
       - name: Check release version consistency
         run: python3 tools/check-release-version
 
