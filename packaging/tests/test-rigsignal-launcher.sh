@@ -227,10 +227,14 @@ verb="${1-}"; shift
 # TWO whole-run quantities have to be scoped here, not one. The sleep COUNTER is
 # what the assertions read. The CLOCK is what the is-active oracle below answers
 # from, and the agent wait advances it before ebpf_start is ever reached -- which
-# silently disarms every clock-keyed scenario: `crashloop` (t -eq 0) and
-# `twotick` (t -lt 2) both stop firing and collapse into the inactive default,
-# so a two-sample streak would ship GREEN. Scoping the counter alone fixes a
-# LOUD failure and leaves a silent one.
+# silently disarms the scenarios whose predicate names a SPECIFIC early tick:
+# `crashloop` (t -eq 0) and `twotick` (t -lt 2) stop firing and collapse into
+# the inactive default, so a two-sample streak would ship GREEN. `flap` is
+# clock-keyed too (t % 2) but SURVIVES, because the shift is even -- measured:
+# with the clock unscoped it was flap, not crashloop, that still caught a
+# single-sample streak. So the damage is not "every clock-keyed scenario"; it
+# is the ones keyed to an absolute early tick, and flap masks their absence.
+# Scoping the counter alone fixes a LOUD failure and leaves a silent one.
 #
 # `[ ! -f ]` is load-bearing: this runs on EVERY system-scoped call, so an
 # unguarded reset would restart the clock at each sample.
