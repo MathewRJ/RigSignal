@@ -356,15 +356,81 @@ validate_elasticsearch() {
 
 # ── Service control ────────────────────────────────────────────────────────────
 
-# Wait up to 10 seconds for a user service to become active.
+# Read the unit's restart counter. Empty when systemd does not export the
+# property; every caller must treat empty as "unknown", never as zero.
+agent_restart_count() {
+    systemctl --user show -p NRestarts --value "$AGENT_UNIT" 2>/dev/null
+}
+
+# Wait for the agent unit to become active AND to stay active.
+#
+# A single is-active sample cannot tell a healthy start from a crash loop. A
+# unit under Restart= is genuinely active for a moment on every restart cycle,
+# so "was it active at any instant" is true of a unit that is failing, and
+# is-active reports that moment correctly. Measured on systemd 259 against this
+# unit's shipped parameters (Type=simple, Restart=on-failure, RestartSec=5): a
+# unit that exits immediately presents a ~0.03 s active window per cycle and one
+# that fails after 0.5 s presents a ~0.53 s window, and a 1 Hz poll landed
+# inside one in 5 and 9 runs out of 10 respectively. The poll is phase-locked to
+# the restart period, so this is not a rare race.
+#
+# Both measured windows are shorter than the poll interval, so requiring
+# consecutive samples separated by a sleep rejects them.
+#
+# What the restart counter does, stated precisely, because it is easy to credit
+# it with more: this function returns as soon as the streak reaches three, so on
+# any path that returns SUCCESS the counter was compared at most twice across
+# roughly two seconds. It does NOT watch a unit after declaring it healthy, and
+# it does not extend observation to the twelve-sample allowance on a start that
+# succeeds. It
+# earns its place on the FAILURE path, where it is read on every one of up to
+# twelve samples and turns a visibly cycling unit into an immediate refusal
+# instead of a twelve-second wait.
+#
+# It also cannot see a restart that falls between its own counter read and the
+# is-active reply of the same iteration. With RestartSec=5 that needs a delay
+# spanning a whole failure and restart, but no finite observation closes it.
+#
+# The bound is 12 samples rather than 10 so that the three-sample settle does
+# not shorten the ten seconds a slow-starting agent previously had to appear.
+#
+# KNOWN RESIDUAL, deliberately not closed here. This catches failures that are
+# fast relative to the poll. It does NOT catch a slow one: the agent's startup
+# Elasticsearch ping is fatal on error (src/main.rs) and its HTTP client allows
+# 30 s (src/shipper.rs), so an endpoint that blackholes rather than refuses
+# leaves the unit genuinely active for far longer than this check observes, and
+# a crash loop of that shape is reported as a healthy start. Closing it belongs
+# in the product -- the agent should not treat a transient endpoint failure as
+# fatal when it has a spool mode -- not in a longer poll here.
 wait_agent_active() {
-    i=0
-    while [ "$i" -lt 10 ]; do
+    _wa_prev=""
+    _wa_streak=0
+    _wa_i=0
+    while [ "$_wa_i" -lt 12 ]; do
+        _wa_now="$(agent_restart_count)"
+        # Only an INCREASE observed WITHIN this wait means the unit restarted
+        # under us. A decrease is legitimate and must not be read as failure:
+        # systemd clears the counter on a start that is not an automatic restart,
+        # so a unit carrying 7 from an earlier run reads 0 immediately after a
+        # manual start. An earlier revision compared against a counter read
+        # before the start, and rejected exactly that healthy case.
+        if [ -n "$_wa_prev" ] && [ -n "$_wa_now" ]; then
+            case "$_wa_prev$_wa_now" in
+                ''|*[!0-9]*) : ;;   # not both plain numbers: no verdict either way
+                *) if [ "$_wa_now" -gt "$_wa_prev" ]; then return 1; fi ;;
+            esac
+        fi
+        _wa_prev="$_wa_now"
         if systemctl --user is-active "$AGENT_UNIT" >/dev/null 2>&1; then
-            return 0
+            _wa_streak=$((_wa_streak + 1))
+            if [ "$_wa_streak" -ge 3 ]; then
+                return 0
+            fi
+        else
+            _wa_streak=0
         fi
         sleep 1
-        i=$((i + 1))
+        _wa_i=$((_wa_i + 1))
     done
     return 1
 }
@@ -1697,12 +1763,18 @@ cmd_setup() {
 
 cmd_start() {
     # Start the user agent service.
+    _start_rc=0
     if systemctl --user start "$AGENT_UNIT" 2>/dev/null; then
         if wait_agent_active; then
-            _ok "Agent started ($AGENT_UNIT)"
+            # Claim only what was observed. A failure after this point, and the
+            # slow-failure shape in wait_agent_active's residual note, will not
+            # appear here.
+            _ok "Agent started ($AGENT_UNIT) — still active after 3 s"
         else
-            _warn "Agent started but did not become active within 10 s — check journald:"
+            _warn "Agent did not stay active — it may be starting and failing repeatedly. Check:"
+            _info "  systemctl --user status $AGENT_UNIT"
             _info "  journalctl --user -u $AGENT_UNIT -n 20"
+            _start_rc=1
         fi
     else
         _die "Failed to start $AGENT_UNIT. Is it installed? Check: systemctl --user status $AGENT_UNIT"
@@ -1710,6 +1782,10 @@ cmd_start() {
 
     # Try the eBPF system service (optional — degrades gracefully).
     ebpf_start || true
+    # An exit status is a report too: this used to return 0 for a unit that was
+    # crash-looping, which is the same false success the message just stopped
+    # making.
+    return "$_start_rc"
 }
 
 # ── Subcommand: stop ───────────────────────────────────────────────────────────
