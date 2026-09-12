@@ -186,6 +186,13 @@ cat > "$ebpf_tmp/bin/sleep" <<'SH'
 # changed `sleep 1` to `sleep 0` would still satisfy a call-count assertion while
 # sampling a single instant repeatedly.
 printf '%s\n' "${1-}" >> "$RS_TEST_STATE/durations"
+# Also attribute the sleep to a PHASE. cmd_start runs the agent wait and the
+# eBPF wait in ONE launcher invocation, so a whole-run count measures both and
+# moves whenever either wait changes. The eBPF phase is delimited by the first
+# system-scoped systemctl call -- the agent half is entirely `--user` -- which
+# is what sets this marker.
+[ -f "$RS_TEST_STATE/ebpf-phase" ] &&
+    printf '%s\n' "${1-}" >> "$RS_TEST_STATE/durations-ebpf"
 t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
 echo $((t + 1)) > "$RS_TEST_STATE/clock"
 exit 0
@@ -213,6 +220,10 @@ cat > "$ebpf_tmp/bin/systemctl" <<'SH'
 scope=system
 [ "${1-}" = "--user" ] && { scope=user; shift; }
 verb="${1-}"; shift
+# Every system-scoped call in cmd_start belongs to ebpf_start, which runs AFTER
+# wait_agent_active; the agent half uses `--user` throughout. So the first
+# system-scoped call is the phase boundary the sleep stub keys on.
+[ "$scope" = system ] && : > "$RS_TEST_STATE/ebpf-phase"
 t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
 case "$scope:$verb" in
     user:start)     exit 0 ;;
@@ -260,8 +271,11 @@ run_ebpf_scenario() {
 ebpf_sleeps() {
     # `wc -l < missing` is a REDIRECT failure reported by the shell, which
     # 2>/dev/null on wc does not suppress; test for the file instead.
-    if [ -f "$ebpf_tmp/state/durations" ]; then
-        wc -l < "$ebpf_tmp/state/durations"
+    # Counts the eBPF phase ONLY. The unscoped whole-run file counts the agent
+    # wait too, so this assertion moved when the consecutive-sample start check
+    # landed and took the healthy scenario from 2 sleeps to 4.
+    if [ -f "$ebpf_tmp/state/durations-ebpf" ]; then
+        wc -l < "$ebpf_tmp/state/durations-ebpf"
     else
         echo 0
     fi
@@ -288,7 +302,7 @@ esac
 # Every sample must be non-interactive; a wait that prompts would hang a start.
 [ -s "$ebpf_tmp/state/sudo-n" ] || { echo "eBPF wait sampled without sudo -n" >&2; exit 1; }
 # And the samples must be a second apart, not zero.
-case "$(sort -u "$ebpf_tmp/state/durations")" in
+case "$(sort -u "$ebpf_tmp/state/durations-ebpf")" in
     1) ;;
     *) echo "eBPF wait did not space its samples by one second" >&2; exit 1 ;;
 esac
