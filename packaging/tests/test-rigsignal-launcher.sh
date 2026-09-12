@@ -346,6 +346,17 @@ esac
     exit 1
 }
 # Every sample must be non-interactive; a wait that prompts would hang a start.
+# SCOPE, and this comment previously committed the very defect R6 fixes above.
+# It read "every sample must be non-interactive", stated as a property of the
+# launcher. That is false of the launcher: ebpf_start DELIBERATELY falls back to
+# a non-`-n` privileged call when the first one fails, and this shim records
+# every privileged invocation, not only wait samples. Measured: in the `nostart`
+# scenario priv-calls reads `n` then `interactive`.
+#
+# The assertion is sound because it is evaluated against the HEALTHY run's state
+# only -- each run_ebpf_scenario wipes the state dir. So the claim is "the healthy
+# start path never prompts", NOT "no privileged call is ever interactive".
+# Widening this to every scenario would red on shipped, deliberate behaviour.
 [ -s "$ebpf_tmp/state/priv-calls" ] || {
     echo "no privileged invocation was recorded at all, so the non-interactive check below measured nothing" >&2
     exit 1
@@ -361,7 +372,14 @@ fi
 # a wrong diagnosis for a missing measurement. Today that is unreachable only
 # because the count assertion above exits first, i.e. it is protected by the
 # ORDER of two assertions rather than by anything structural.
-[ -f "$ebpf_tmp/state/durations-ebpf" ] || {
+# -s, not -f: a file that EXISTS BUT IS EMPTY passes -f, reaches the case below
+# with an empty word, and lands on exactly the wrong-diagnosis arm this guard
+# exists to prevent. Not reachable today -- but `expect_start` 200 lines below
+# already uses `: > .../durations` as its per-scenario reset, so an empty-file
+# initialiser for this one is the obvious next edit, and it would restore the
+# defect while leaving the guard green. The sibling assertion above already uses
+# -s; using the weaker primitive here was an inconsistency, not a decision.
+[ -s "$ebpf_tmp/state/durations-ebpf" ] || {
     echo "no eBPF sleep durations were recorded, so sample spacing was never measured" >&2
     exit 1
 }
