@@ -356,15 +356,81 @@ validate_elasticsearch() {
 
 # ── Service control ────────────────────────────────────────────────────────────
 
-# Wait up to 10 seconds for a user service to become active.
+# Read the unit's restart counter. Empty when systemd does not export the
+# property; every caller must treat empty as "unknown", never as zero.
+agent_restart_count() {
+    systemctl --user show -p NRestarts --value "$AGENT_UNIT" 2>/dev/null
+}
+
+# Wait for the agent unit to become active AND to stay active.
+#
+# A single is-active sample cannot tell a healthy start from a crash loop. A
+# unit under Restart= is genuinely active for a moment on every restart cycle,
+# so "was it active at any instant" is true of a unit that is failing, and
+# is-active reports that moment correctly. Measured on systemd 259 against this
+# unit's shipped parameters (Type=simple, Restart=on-failure, RestartSec=5): a
+# unit that exits immediately presents a ~0.03 s active window per cycle and one
+# that fails after 0.5 s presents a ~0.53 s window, and a 1 Hz poll landed
+# inside one in 5 and 9 runs out of 10 respectively. The poll is phase-locked to
+# the restart period, so this is not a rare race.
+#
+# Both measured windows are shorter than the poll interval, so requiring
+# consecutive samples separated by a sleep rejects them.
+#
+# What the restart counter does, stated precisely, because it is easy to credit
+# it with more: this function returns as soon as the streak reaches three, so on
+# any path that returns SUCCESS the counter was compared at most twice across
+# roughly two seconds. It does NOT watch a unit after declaring it healthy, and
+# it does not extend observation to the twelve-sample allowance on a start that
+# succeeds. It
+# earns its place on the FAILURE path, where it is read on every one of up to
+# twelve samples and turns a visibly cycling unit into an immediate refusal
+# instead of a twelve-second wait.
+#
+# It also cannot see a restart that falls between its own counter read and the
+# is-active reply of the same iteration. With RestartSec=5 that needs a delay
+# spanning a whole failure and restart, but no finite observation closes it.
+#
+# The bound is 12 samples rather than 10 so that the three-sample settle does
+# not shorten the ten seconds a slow-starting agent previously had to appear.
+#
+# KNOWN RESIDUAL, deliberately not closed here. This catches failures that are
+# fast relative to the poll. It does NOT catch a slow one: the agent's startup
+# Elasticsearch ping is fatal on error (src/main.rs) and its HTTP client allows
+# 30 s (src/shipper.rs), so an endpoint that blackholes rather than refuses
+# leaves the unit genuinely active for far longer than this check observes, and
+# a crash loop of that shape is reported as a healthy start. Closing it belongs
+# in the product -- the agent should not treat a transient endpoint failure as
+# fatal when it has a spool mode -- not in a longer poll here.
 wait_agent_active() {
-    i=0
-    while [ "$i" -lt 10 ]; do
+    _wa_prev=""
+    _wa_streak=0
+    _wa_i=0
+    while [ "$_wa_i" -lt 12 ]; do
+        _wa_now="$(agent_restart_count)"
+        # Only an INCREASE observed WITHIN this wait means the unit restarted
+        # under us. A decrease is legitimate and must not be read as failure:
+        # systemd clears the counter on a start that is not an automatic restart,
+        # so a unit carrying 7 from an earlier run reads 0 immediately after a
+        # manual start. An earlier revision compared against a counter read
+        # before the start, and rejected exactly that healthy case.
+        if [ -n "$_wa_prev" ] && [ -n "$_wa_now" ]; then
+            case "$_wa_prev$_wa_now" in
+                ''|*[!0-9]*) : ;;   # not both plain numbers: no verdict either way
+                *) if [ "$_wa_now" -gt "$_wa_prev" ]; then return 1; fi ;;
+            esac
+        fi
+        _wa_prev="$_wa_now"
         if systemctl --user is-active "$AGENT_UNIT" >/dev/null 2>&1; then
-            return 0
+            _wa_streak=$((_wa_streak + 1))
+            if [ "$_wa_streak" -ge 3 ]; then
+                return 0
+            fi
+        else
+            _wa_streak=0
         fi
         sleep 1
-        i=$((i + 1))
+        _wa_i=$((_wa_i + 1))
     done
     return 1
 }
@@ -608,6 +674,18 @@ assets_interrupted() {
     # interrupts wait without reaping the child; that first status is not the
     # engine status. Disable reentry before forwarding or waiting again.
     trap '' HUP INT TERM
+    # The engine's lifetime begins at fork, not at the assignment on the next
+    # line.  A signal delivered between `engine &` and `ASSETS_ENGINE_PID=$!`
+    # finds the registration variable still empty, so every branch below would
+    # take its no-engine path and cleanup would delete the one-shot credential
+    # while a live engine still expects it.  $! is already the engine's pid in
+    # that window, so resolve from it.  ASSETS_ENGINE_SPAWNED is what makes
+    # that safe: $! keeps naming the engine after it has been reaped, and pid
+    # numbers are recycled, so an ungated fallback could signal an unrelated
+    # process.  Resolve before the watchdog below, which reassigns $!.
+    if [ -z "${ASSETS_ENGINE_PID:-}" ] && [ "${ASSETS_ENGINE_SPAWNED:-0}" = "1" ]; then
+        ASSETS_ENGINE_PID=$!
+    fi
     # Preserve a completed ordinary wait before starting any background job:
     # dash can discard its cached status when the watchdog is spawned.
     if [ -n "${ASSETS_ENGINE_PID:-}" ] && ! kill -0 "$ASSETS_ENGINE_PID" 2>/dev/null; then
@@ -647,8 +725,17 @@ PYEOF
     else
         [ -n "${ASSETS_ENGINE_STATUS+x}" ] || ASSETS_ENGINE_STATUS=$_assets_signal_status
     fi
-    assets_cleanup "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
-    trap - EXIT HUP INT TERM
+    # Retire the EXIT trap BEFORE teardown, and handle cleanup's return
+    # deliberately.  assets_cleanup returns the status it was given and resets
+    # ASSETS_CLEANING on the way out, so with errexit enabled above a nonzero
+    # engine status ended the shell on this very line -- before the trap was
+    # removed -- and the still-installed EXIT trap ran cleanup a second time.
+    # HUP/INT/TERM stay ignored (set at the top of this handler) across the
+    # teardown, so a second signal during cleanup still cannot strand the
+    # one-shot credential; they are retired only once teardown is complete.
+    trap - EXIT
+    assets_cleanup "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}" || true
+    trap - HUP INT TERM
     exit "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
 }
 
@@ -1001,7 +1088,7 @@ PY
     resolve_assets_installation || _assets_die "assets install: matching engine installation is unavailable"
     ASSETS_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rigsignal-assets.XXXXXX") || _assets_die "assets install: could not create private temporary directory"
     chmod 700 "$ASSETS_TMP" || _assets_die "assets install: could not secure temporary directory"
-    ASSETS_ENGINE_PID=""
+    ASSETS_ENGINE_PID="" ASSETS_ENGINE_SPAWNED=0
     trap assets_cleanup EXIT
     trap 'assets_interrupted HUP' HUP
     trap 'assets_interrupted INT' INT
@@ -1065,6 +1152,11 @@ PY
     # On a signal the cancellation handler owns reaping and exits; this
     # ordinary wait path is only resumed when no cancellation was handled.
     set +e
+    # Declare the spawn before the fork and retire it only once the engine has
+    # been reaped: this flag is what licenses the handler to resolve the pid
+    # from $! during the spawn/registration window, and what stops it doing so
+    # once $! names a reaped pid whose number may have been recycled.
+    ASSETS_ENGINE_SPAWNED=1
     python3 "$ASSETS_ENGINE/install_assets.py" --assets-only --profile user --ownership-profile default \
         --bundle "$ASSETS_BUNDLE_SNAPSHOT" --endpoint "$ASSETS_ENDPOINT" --ca-file "$CA_SNAPSHOT" \
         --kibana-endpoint "$ASSETS_KIBANA" --kibana-ca-file "$CA_SNAPSHOT" \
@@ -1072,6 +1164,7 @@ PY
     ASSETS_ENGINE_PID=$!
     wait "$ASSETS_ENGINE_PID"
     ASSETS_ENGINE_STATUS=$?
+    ASSETS_ENGINE_SPAWNED=0
     ASSETS_ENGINE_PID=""
     set -e
     return "$ASSETS_ENGINE_STATUS"
@@ -1779,20 +1872,39 @@ cmd_setup() {
 # ── Subcommand: start ──────────────────────────────────────────────────────────
 
 cmd_start() {
+    # Clearing a failed state is new here, and it is the other half of widening
+    # the start limiter window.  Before that change the limiter could never trip,
+    # so the unit could not reach `failed` by crash-looping and this path was
+    # unreachable; now it can.  A unit in that state refuses `systemctl start`
+    # with a generic exit-code error, and the diagnostic below used to blame a
+    # missing installation -- the wrong cause, for a user who has just fixed
+    # their configuration and is trying again.  `cmd_run` has cleared it since
+    # the previous instance of this bug class; the documented start path did not.
+    systemctl --user reset-failed "$AGENT_UNIT" >/dev/null 2>&1 || true
     # Start the user agent service.
+    _start_rc=0
     if systemctl --user start "$AGENT_UNIT" 2>/dev/null; then
         if wait_agent_active; then
-            _ok "Agent started ($AGENT_UNIT)"
+            # Claim only what was observed. A failure after this point, and the
+            # slow-failure shape in wait_agent_active's residual note, will not
+            # appear here.
+            _ok "Agent started ($AGENT_UNIT) — still active after 3 s"
         else
-            _warn "Agent started but did not become active within 10 s — check journald:"
+            _warn "Agent did not stay active — it may be starting and failing repeatedly. Check:"
+            _info "  systemctl --user status $AGENT_UNIT"
             _info "  journalctl --user -u $AGENT_UNIT -n 20"
+            _start_rc=1
         fi
     else
-        _die "Failed to start $AGENT_UNIT. Is it installed? Check: systemctl --user status $AGENT_UNIT"
+        _die "Failed to start $AGENT_UNIT. Is it installed, and does its configuration parse? Check: systemctl --user status $AGENT_UNIT"
     fi
 
     # Try the eBPF system service (optional — degrades gracefully).
     ebpf_start || true
+    # An exit status is a report too: this used to return 0 for a unit that was
+    # crash-looping, which is the same false success the message just stopped
+    # making.
+    return "$_start_rc"
 }
 
 # ── Subcommand: stop ───────────────────────────────────────────────────────────
@@ -1825,6 +1937,30 @@ cmd_status() {
     fi
     if [ -n "$last_label" ]; then
         printf "  Last label: %s\n" "$last_label"
+    fi
+
+    # Elasticsearch delivery health.  The agent no longer aborts on a failed
+    # startup preflight, so an unreachable or misconfigured endpoint no longer
+    # shows up as a crash-looping unit above.  This line is what replaces that
+    # visibility for an operator who only runs `rigsignal status`.
+    #
+    # -b bounds it to the CURRENT BOOT and the journal timestamp is kept.  Both
+    # matter: in the healthy steady state the agent says nothing at all, so two
+    # hundred lines can reach back weeks, and an outage that ended days ago would
+    # otherwise print here as if it were current state.  The two greps above are
+    # labelled "Last game" and "Last label"; this one would read as now.
+    #
+    # The marker is anchored immediately after the tracing target so an ordinary
+    # game name cannot drift into this line.  That is a narrowing, NOT a
+    # guarantee: these messages are unescaped, so text a user controls can still
+    # contain whatever it likes.  Closing that properly means escaping dynamic
+    # text in the agent's own log output, which changes existing log lines and is
+    # tracked separately.
+    last_delivery=$(journalctl --user -u "$AGENT_UNIT" -b -n 200 -o short-iso --no-pager 2>/dev/null \
+        | grep -E 'WARN rigsignal_agent: ES_DELIVERY ' | tail -1 \
+        | sed -n 's/^\([^ ]*\) .*WARN rigsignal_agent: ES_DELIVERY \(.*\)$/\1  \2/p')
+    if [ -n "$last_delivery" ]; then
+        printf "  Delivery:   %s\n" "$last_delivery"
     fi
 
     printf "\n  Logs:   journalctl --user -u %s -f\n" "$AGENT_UNIT"

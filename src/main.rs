@@ -44,6 +44,196 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 const BUILD_COMMIT: &str = env!("RIGSIGNAL_BUILD_COMMIT");
 
+/// Marker on the lines about Elasticsearch delivery health that are SAFE to
+/// surface outside the journal, so one grep finds the outage story: each repeat
+/// while the endpoint stays unreachable, and the recovery.
+///
+/// A failed startup preflight no longer aborts the process. That removed the
+/// crash loop an operator could see in `systemctl status`, so these lines are
+/// what replaces it -- without them a permanently misconfigured endpoint would
+/// simply be quiet.
+///
+/// Lines carrying this marker are built only from a timestamp and a count. They
+/// deliberately carry NO error text: `rigsignal status` echoes the most recent
+/// one to stdout, and the errors on this path are wrapped with a context that
+/// interpolates the configured endpoint -- which may itself carry a credential
+/// in a query parameter. Error detail stays in the journal on unmarked lines.
+const ES_DELIVERY_MARKER: &str = "ES_DELIVERY";
+
+/// Minimum gap between repeats of the unreachable warning. The warning is
+/// rate-limited but never suppressed: it keeps repeating for as long as the
+/// condition holds, because an operator may attach to the log at any time.
+const ES_UNREACHABLE_REPEAT_SECS: u64 = 60;
+
+// Bounds on the window, enforced at COMPILE time because they are properties of
+// the constant rather than of any run. Too long and an operator attaching to the
+// log waits out an outage in silence; too short and the warning is a flood. An
+// earlier revision asserted these in a test that divided 3600 by the same
+// constant, so widening the window to a day made the test assert 0 == 0 and pass.
+const _: () = assert!(
+    ES_UNREACHABLE_REPEAT_SECS >= 5 && ES_UNREACHABLE_REPEAT_SECS <= 300,
+    "the unreachable warning must repeat between every 5s and every 5min"
+);
+
+/// One emission of the persistent unreachable warning.
+struct EsUnreachable {
+    since_unix: u64,
+    attempts: u64,
+}
+
+impl EsUnreachable {
+    fn since_rfc3339(&self) -> String {
+        chrono::DateTime::from_timestamp(self.since_unix as i64, 0)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| format!("unix:{}", self.since_unix))
+    }
+}
+
+/// The outage currently in progress.
+struct Outage {
+    since_unix: u64,
+    attempts: u64,
+    /// Whether the operator has been told about THIS outage. Recovery is only
+    /// announced for an outage that was announced: without that, an endpoint
+    /// that fails and succeeds alternately emits a failure and a recovery line
+    /// every tick forever, and a sustained 50% loss reads as healthy.
+    announced: bool,
+}
+
+#[derive(Default)]
+struct EsDeliveryState {
+    outage: Option<Outage>,
+    /// When a failure line was last emitted, kept ACROSS outage boundaries so
+    /// the rate limit cannot be defeated by alternation rather than volume.
+    last_spoke_unix: Option<u64>,
+}
+
+/// Consecutive-failure tracker for Elasticsearch delivery.
+///
+/// Tick shipping runs in detached tasks, so this is shared across tasks. It is
+/// ONE mutex rather than several atomics, and that is a correctness choice. With
+/// separate atomics, a `record_success` landing between a `record_failure`'s
+/// claim of the outage start and its re-read of that field made the warning print
+/// the epoch; another interleaving left a stale last-warned stamp behind a
+/// cleared outage and silenced the first 59 s of the NEXT outage; a third let
+/// "recovered" print after "failing", which is the line `rigsignal status` then
+/// shows. All three were reachable, and all three are gone once the fields move
+/// under one lock. It is taken once per delivery against a 1 Hz tick.
+#[derive(Default)]
+struct EsDeliveryHealth {
+    state: std::sync::Mutex<EsDeliveryState>,
+}
+
+impl EsDeliveryHealth {
+    /// Record one failed delivery.
+    ///
+    /// Returns `Some` when the caller should emit the persistent warning: at most
+    /// once per `ES_UNREACHABLE_REPEAT_SECS`, counted across outages.
+    fn record_failure(&self, now_unix: u64) -> Option<EsUnreachable> {
+        // A panicking ship task must not wedge the tracker: recovering the guard
+        // is strictly better than never warning again.
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let due = match g.last_spoke_unix {
+            None => true,
+            // `now_unix < last` is the backward-clock guard and is load-bearing.
+            // An earlier revision used `saturating_sub`, so a clock STEP backwards
+            // saturated the difference to zero and nothing was due until real time
+            // caught up: measured at 7259 consecutive failed ticks silent after a
+            // two-hour step. The clock is CLOCK_REALTIME and the units are ordered
+            // `After=network.target`, not `After=time-sync.target`, so a step
+            // correction shortly after boot is the ordinary path.
+            Some(last) => now_unix < last || now_unix - last >= ES_UNREACHABLE_REPEAT_SECS,
+        };
+        let outage = g.outage.get_or_insert(Outage {
+            since_unix: now_unix,
+            attempts: 0,
+            announced: false,
+        });
+        outage.attempts += 1;
+        if !due {
+            return None;
+        }
+        outage.announced = true;
+        let emission = EsUnreachable {
+            since_unix: outage.since_unix,
+            attempts: outage.attempts,
+        };
+        g.last_spoke_unix = Some(now_unix);
+        Some(emission)
+    }
+
+    /// Record one successful delivery. Returns the number of failures it ended,
+    /// or `None` if nothing was wrong or the outage was never announced.
+    fn record_success(&self) -> Option<u64> {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match g.outage.take() {
+            Some(o) if o.announced => Some(o.attempts),
+            _ => None,
+        }
+    }
+
+    /// Attempts recorded against the outage in progress, or `None` if there is
+    /// none. Test-only: emission is rate-limited across outages, so "did this
+    /// count?" and "did this print?" are different questions and a test that can
+    /// only see the second cannot check the first.
+    #[cfg(test)]
+    fn outage_attempts(&self) -> Option<u64> {
+        let g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.outage.as_ref().map(|o| o.attempts)
+    }
+
+    /// Account for a failed delivery and say so if a line is due.
+    fn note_failure(&self) {
+        if let Some(state) = self.record_failure(now_unix_secs()) {
+            tracing::warn!(
+                "{} Elasticsearch delivery failing since {}, {} consecutive failed \
+                 deliveries — documents are being dropped",
+                ES_DELIVERY_MARKER,
+                state.since_rfc3339(),
+                state.attempts
+            );
+        }
+    }
+
+    /// Account for a delivery in which every document landed.
+    ///
+    /// Recovery is `warn!` rather than `info!` on purpose: the units ship
+    /// `Environment=RIGSIGNAL_LOG=info`, and at any level where the failures are
+    /// visible the line saying they stopped must be visible too.
+    fn note_success(&self) {
+        if let Some(after) = self.record_success() {
+            tracing::warn!(
+                "{} Elasticsearch delivery recovered after {} consecutive failed deliveries",
+                ES_DELIVERY_MARKER,
+                after
+            );
+        }
+    }
+
+    /// Account for one bulk outcome.
+    ///
+    /// A partial or total REJECTION is a delivery failure even though the
+    /// request itself succeeded. `ship_documents` returns `Err` only for
+    /// transport errors and a non-2xx status; when Elasticsearch crosses its
+    /// flood-stage watermark and sets `index.blocks.read_only_allow_delete`, or
+    /// when a field mapping conflicts, the bulk returns HTTP 200 with every item
+    /// rejected. An earlier revision called this SUCCESS before looking at
+    /// `failed`, so total document loss was reported to the operator as
+    /// "recovered" — surviving loudly and wrongly, which is worse than the quiet
+    /// failure this instrumentation exists to prevent.
+    fn observe(&self, outcome: &Result<shipper::ShipResult>) {
+        match outcome {
+            Ok(r) if r.failed == 0 => self.note_success(),
+            _ => self.note_failure(),
+        }
+    }
+}
+
+/// Seconds since the Unix epoch.
+fn now_unix_secs() -> u64 {
+    Utc::now().timestamp().max(0) as u64
+}
+
 fn build_info_json(name: &str) -> String {
     json!({
         "name": name,
@@ -721,10 +911,20 @@ fn resolve_log_filter(verbose: bool, log_level: Option<&str>) -> String {
     std::env::var("RIGSIGNAL_LOG").unwrap_or_else(|_| "info".to_string())
 }
 
+/// Write documents to whichever output the configuration selects.
+///
+/// `es_health` is updated on the Elasticsearch path only. Routing every caller
+/// through here is what makes the counter honest: five of the six delivery sites
+/// are one-shot documents (session start, game detected, summary on game exit,
+/// remote connections, final summary), and while only the tick was instrumented
+/// a session-start document lost before the first tick was invisible to
+/// `rigsignal status` and did not count, so "N consecutive failed deliveries"
+/// under-reported the documents actually dropped.
 async fn write_output(
     cfg: &config::Config,
     spool_writer: &mut Option<SpoolWriter>,
     docs: Vec<Value>,
+    es_health: &EsDeliveryHealth,
 ) -> Result<shipper::ShipResult> {
     if let Some(writer) = spool_writer {
         let attempted = docs.len();
@@ -735,7 +935,9 @@ async fn write_output(
             failed: 0,
         })
     } else {
-        shipper::ship(cfg, docs).await
+        let outcome = shipper::ship(cfg, docs).await;
+        es_health.observe(&outcome);
+        outcome
     }
 }
 
@@ -927,9 +1129,34 @@ async fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let es_health = std::sync::Arc::new(EsDeliveryHealth::default());
+
     let mut spool_writer = match cfg.output.mode {
         OutputMode::Elasticsearch => {
-            shipper::ping(&cfg).await?;
+            // A failed preflight is NOT fatal. The identical failure one tick
+            // later is already only a warning, and `rigsignal setup` validates
+            // the endpoint, API key, privileges and version floor before any of
+            // this — so at every start after the first, aborting here could only
+            // convert a transient outage into a crash loop. It cannot tell a
+            // blip from a misconfiguration, so it must not act as though it can.
+            //
+            // Seed the tracker either way: this counts as attempt 1 of the
+            // outage, which also means the tick path will not repeat the
+            // warning for another ES_UNREACHABLE_REPEAT_SECS.
+            if let Err(e) = shipper::ping(&cfg).await {
+                let _ = es_health.record_failure(now_unix_secs());
+                // Two lines on purpose. The MARKED one is echoed to stdout by
+                // `rigsignal status`, so it carries no error text: the context on
+                // this path interpolates the configured endpoint, and an endpoint
+                // can carry a credential in a query parameter. The detail stays in
+                // the journal on an unmarked line, exactly where it was before.
+                tracing::warn!(
+                    "{} startup preflight failed — continuing; documents will be \
+                     dropped until Elasticsearch is reachable",
+                    ES_DELIVERY_MARKER
+                );
+                tracing::warn!("Elasticsearch startup preflight error: {}", e);
+            }
             None
         }
         OutputMode::Spool => Some(SpoolWriter::new(
@@ -1059,8 +1286,8 @@ async fn run() -> Result<ExitCode> {
 
     // Ship session-start document
     let start_doc = build_session_start_doc(&session, &host_snapshot, &hostname);
-    if let Err(e) = write_output(&cfg, &mut spool_writer, vec![start_doc]).await {
-        tracing::warn!("Failed to ship session-start doc: {}", e);
+    if let Err(e) = write_output(&cfg, &mut spool_writer, vec![start_doc], &es_health).await {
+        tracing::warn!("Failed to ship session-start doc: {}", error_for_log(&e));
     }
 
     // Signal handlers — spawned watcher sends on a oneshot so the select! arm
@@ -1154,8 +1381,8 @@ async fn run() -> Result<ExitCode> {
                         let game_doc = build_game_detected_doc(
                             &session, &host_snapshot, &hostname, &target,
                         );
-                        if let Err(e) = write_output(&cfg, &mut spool_writer, vec![game_doc]).await {
-                            tracing::warn!("Failed to ship game-detected doc: {}", e);
+                        if let Err(e) = write_output(&cfg, &mut spool_writer, vec![game_doc], &es_health).await {
+                            tracing::warn!("Failed to ship game-detected doc: {}", error_for_log(&e));
                         }
                     }
                     SessionEvent::GameEnded(target) => {
@@ -1180,8 +1407,8 @@ async fn run() -> Result<ExitCode> {
                                 "Shipping session summary on game exit ({}s, {} ticks)",
                                 duration_s, session_tick
                             );
-                            if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc]).await {
-                                tracing::warn!("Failed to ship summary doc on game exit: {}", e);
+                            if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc], &es_health).await {
+                                tracing::warn!("Failed to ship summary doc on game exit: {}", error_for_log(&e));
                             } else if matches!(cfg.output.mode, OutputMode::Elasticsearch) {
                                 if let Err(e) = shipper::trigger_transform_sync(&cfg, "rigsignal-game-timeline").await {
                                     tracing::warn!("transform schedule_now failed (non-fatal): {}", e);
@@ -1275,8 +1502,11 @@ async fn run() -> Result<ExitCode> {
                     let tick_num = tick;
                     if matches!(cfg.output.mode, OutputMode::Elasticsearch) {
                         let cfg_ship = cfg.clone();
+                        let health = es_health.clone();
                         tokio::spawn(async move {
-                            match shipper::ship(&cfg_ship, tick_docs).await {
+                            let outcome = shipper::ship(&cfg_ship, tick_docs).await;
+                            health.observe(&outcome);
+                            match &outcome {
                                 Ok(r) => {
                                     if r.failed > 0 {
                                         tracing::warn!(
@@ -1289,11 +1519,13 @@ async fn run() -> Result<ExitCode> {
                                         tracing::debug!("Tick {}: shipped {} docs", tick_num, n);
                                     }
                                 }
-                                Err(e) => tracing::warn!("Tick {} bulk error: {}", tick_num, e),
+                                Err(e) => {
+                                    tracing::warn!("Tick {} bulk error: {}", tick_num, e);
+                                }
                             }
                         });
-                    } else if let Err(e) = write_output(&cfg, &mut spool_writer, tick_docs).await {
-                        tracing::warn!("Tick {} spool error: {}", tick_num, e);
+                    } else if let Err(e) = write_output(&cfg, &mut spool_writer, tick_docs, &es_health).await {
+                        tracing::warn!("Tick {} spool error: {}", tick_num, error_for_log(&e));
                     } else {
                         tracing::debug!("Tick {}: spooled {} docs", tick_num, n);
                     }
@@ -1301,7 +1533,7 @@ async fn run() -> Result<ExitCode> {
 
                 if let Some(writer) = spool_writer.as_mut() {
                     if let Err(e) = writer.rotate_stale_files() {
-                        tracing::warn!("Tick {} spool rotation error: {}", tick, e);
+                        tracing::warn!("Tick {} spool rotation error: {}", tick, error_for_log(&e));
                     }
                 }
             }
@@ -1331,8 +1563,8 @@ async fn run() -> Result<ExitCode> {
             duration_s,
             session_tick
         );
-        if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc]).await {
-            tracing::warn!("Failed to ship summary doc: {}", e);
+        if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc], &es_health).await {
+            tracing::warn!("Failed to ship summary doc: {}", error_for_log(&e));
         } else {
             summary_written = true;
         }
@@ -1349,7 +1581,10 @@ async fn run() -> Result<ExitCode> {
     // write must never strand already-buffered metric batches at shutdown.
     if let Some(writer) = spool_writer.as_mut() {
         if let Err(e) = writer.finalize_all() {
-            tracing::warn!("Failed to finalize spool files during shutdown: {}", e);
+            tracing::warn!(
+                "Failed to finalize spool files during shutdown: {}",
+                error_for_log(&e)
+            );
         }
     }
 
@@ -1386,9 +1621,548 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
     }
 }
 
+/// Render an error for an operator log: the error's own message, plus the OS
+/// error code and its strerror text when one is anywhere in the cause chain,
+/// and nothing else.
+///
+/// Why this exists, and why it is not simply `{:#}`. On a full disk the spool
+/// warnings printed only `flushing spool writer` — the errno never reached the
+/// log, because `anyhow` shows the cause chain only under the alternate format.
+/// Switching those warnings to `{:#}` does surface the errno, but it also
+/// surfaces every other cause verbatim, and a non-author review reproduced three
+/// consequences of that: the Elasticsearch URL including a URL-borne credential
+/// (four of these call sites also serve direct delivery, where a request failure
+/// is wrapped in a static context over a `reqwest::Error`), a spool file path,
+/// and a cause containing a newline splitting one log event into two.
+///
+/// So this takes the errno and refuses the free text. An `io::Error` returns
+/// `Some` from `raw_os_error()` only when it holds the OS representation, and
+/// that representation's `Display` is the platform error string plus the number
+/// — there is no slot in it for caller-supplied text. That is the property being
+/// relied on. It is NOT a claim that a syscall produced the value:
+/// `from_raw_os_error` lets a caller choose the number. Choosing a misleading
+/// errno is a far smaller problem than echoing an arbitrary string, which is the
+/// trade this makes. When no OS error is in the chain the output is
+/// byte-identical to the previous `{}` behaviour, so nothing that used to be
+/// logged stops being logged.
+fn error_for_log(err: &anyhow::Error) -> String {
+    for (depth, cause) in err.chain().enumerate() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.raw_os_error().is_some() {
+                // At depth 0 the error IS the OS error, so its own Display is
+                // already the message; appending would print it twice. Reachable:
+                // a failed removal of an empty replacement file propagates a bare
+                // io::Error with no context.
+                if depth == 0 {
+                    return format!("{err}");
+                }
+                return format!("{err}: {io_err}");
+            }
+        }
+    }
+    format!("{err}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plausible wall-clock value. Tests use realistic timestamps so they
+    /// exercise the same arithmetic the product sees.
+    const T0: u64 = 1_757_000_000;
+
+    #[test]
+    fn first_failure_of_an_outage_always_warns() {
+        let h = EsDeliveryHealth::default();
+        let first = h.record_failure(T0).expect("first failure must warn");
+        assert_eq!(first.attempts, 1);
+        assert_eq!(first.since_unix, T0);
+    }
+
+    #[test]
+    fn repeats_inside_the_window_are_suppressed_but_still_counted() {
+        let h = EsDeliveryHealth::default();
+        // Setup assertion: if the first call did not warn, the silence below
+        // would prove nothing about rate limiting.
+        assert!(h.record_failure(T0).is_some(), "setup: first must warn");
+
+        for offset in [1, 5, 30, ES_UNREACHABLE_REPEAT_SECS - 1] {
+            assert!(
+                h.record_failure(T0 + offset).is_none(),
+                "a repeat {offset}s into a {ES_UNREACHABLE_REPEAT_SECS}s window must not warn"
+            );
+        }
+
+        let due = h
+            .record_failure(T0 + ES_UNREACHABLE_REPEAT_SECS)
+            .expect("warning is due once the window elapses");
+        assert_eq!(
+            due.attempts, 6,
+            "all attempts counted, including the suppressed ones"
+        );
+        assert_eq!(due.since_unix, T0, "the outage start must not move");
+    }
+
+    /// The operator-facing property, asserted in ABSOLUTE terms.
+    ///
+    /// An earlier version of this test asserted
+    /// `emissions == 3600 / ES_UNREACHABLE_REPEAT_SECS`, which puts the constant
+    /// under test on both sides of the comparison. Widening the window to a day
+    /// made it assert `0 == 0` and pass, so "warn once then go quiet for 24 h"
+    /// was indistinguishable from the mute-forever case this test exists to
+    /// exclude. The numbers below are fixed independently of the constant.
+    #[test]
+    fn the_warning_is_rate_limited_but_never_suppressed_for_good() {
+        let h = EsDeliveryHealth::default();
+        assert!(h.record_failure(T0).is_some(), "setup: first must warn");
+        let mut emissions = 0;
+        for second in 1..=3600 {
+            if h.record_failure(T0 + second).is_some() {
+                emissions += 1;
+            }
+        }
+        assert!(
+            emissions >= 12,
+            "an hour of continuous failure produced {emissions} warnings; the outage \
+             must stay audible throughout, not be announced once"
+        );
+    }
+
+    #[test]
+    fn success_reports_the_recovery_and_starts_a_fresh_outage_afterwards() {
+        let h = EsDeliveryHealth::default();
+        assert!(h.record_failure(T0).is_some(), "setup: first must warn");
+        assert!(
+            h.record_failure(T0 + 1).is_none(),
+            "setup: second suppressed"
+        );
+
+        assert_eq!(
+            h.record_success(),
+            Some(2),
+            "recovery reports both attempts"
+        );
+        assert_eq!(h.record_success(), None, "a healthy run says nothing");
+
+        // A later outage is a NEW outage: its `since` is its own start and its
+        // count restarts. It is NOT announced immediately, and that is
+        // deliberate rather than a regression -- the last-spoke stamp is kept
+        // across outage boundaries so an endpoint alternating between failure and
+        // success cannot emit a warn/recovery pair on every tick. The cost is
+        // that a genuine new outage can wait up to one window to be named; the
+        // count is accurate throughout.
+        assert!(
+            h.record_failure(T0 + 5).is_none(),
+            "a new outage inside the window must not re-announce"
+        );
+        assert_eq!(h.outage_attempts(), Some(1), "but it must still be counted");
+
+        let again = h
+            .record_failure(T0 + 5 + ES_UNREACHABLE_REPEAT_SECS)
+            .expect("a new outage is named once the window has passed");
+        assert_eq!(again.attempts, 2);
+        assert_eq!(
+            again.since_unix,
+            T0 + 5,
+            "the new outage reports its OWN start, not the old one"
+        );
+    }
+
+    /// A clock that steps BACKWARDS must not black out the warning.
+    ///
+    /// The predicate used `saturating_sub`, so after a backward step the
+    /// difference saturated to zero and nothing was due until real time caught
+    /// up -- measured at 7259 consecutive silent failures after a two-hour step.
+    /// The clock is CLOCK_REALTIME and the units are ordered
+    /// `After=network.target`, not `After=time-sync.target`, so a step
+    /// correction shortly after boot is the ordinary path.
+    #[test]
+    fn a_backward_clock_step_does_not_silence_the_warning() {
+        for step_back in [1u64, 60, 7200, 86_400] {
+            let h = EsDeliveryHealth::default();
+            assert!(h.record_failure(T0).is_some(), "setup: first must warn");
+            assert!(
+                h.record_failure(T0 - step_back).is_some(),
+                "a {step_back}s backward clock step silenced the warning"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_failures_emit_exactly_one_warning_per_window() {
+        use std::sync::{Arc, Barrier};
+        // Tick shipping runs in detached tasks, so several can fail at once.
+        //
+        // THE BARRIER IS THE SETUP, not decoration. Spawning threads in a loop
+        // does not make them contend: the first finishes before the last is
+        // created, each then sees the previous one's stamp, and the single
+        // emission that results proves nothing. An earlier version of this test
+        // lacked the barrier and passed against a deliberately broken build.
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 200;
+        for _ in 0..ROUNDS {
+            let h = Arc::new(EsDeliveryHealth::default());
+            let gate = Arc::new(Barrier::new(THREADS));
+            let mut handles = Vec::new();
+            for _ in 0..THREADS {
+                let h = h.clone();
+                let gate = gate.clone();
+                handles.push(std::thread::spawn(move || {
+                    gate.wait();
+                    usize::from(h.record_failure(T0).is_some())
+                }));
+            }
+            let emissions: usize = handles.into_iter().map(|t| t.join().expect("join")).sum();
+            assert_eq!(emissions, 1, "exactly one task may emit per window");
+        }
+    }
+
+    /// A recovery landing between a failure's start-of-outage and its own read of
+    /// that field used to make the warning print the epoch. Holding one lock for
+    /// the whole operation makes that unrepresentable; this pins it.
+    #[test]
+    fn a_racing_recovery_never_produces_an_epoch_timestamp() {
+        use std::sync::Arc;
+        let h = Arc::new(EsDeliveryHealth::default());
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let h = h.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut bad = Vec::new();
+                for n in 0..500u64 {
+                    if i % 2 == 0 {
+                        if let Some(u) = h.record_failure(T0 + n) {
+                            if u.since_unix == 0 {
+                                bad.push(u.since_unix);
+                            }
+                        }
+                    } else {
+                        h.record_success();
+                    }
+                }
+                bad
+            }));
+        }
+        let bad: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|t| t.join().expect("join"))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "a racing recovery produced {} epoch timestamps",
+            bad.len()
+        );
+    }
+
+    /// A bulk that returns HTTP 200 while rejecting documents is a DELIVERY
+    /// FAILURE, not a success.
+    ///
+    /// `ship_documents` returns `Err` only for transport errors and a non-2xx
+    /// status. When Elasticsearch crosses its flood-stage watermark and sets
+    /// `index.blocks.read_only_allow_delete`, or a field mapping conflicts, the
+    /// bulk returns 200 with every item rejected. An earlier revision recorded
+    /// success before examining `failed`, so total document loss was announced to
+    /// the operator as "recovered" -- and that is the line `rigsignal status`
+    /// shows.
+    ///
+    /// Asserted through the attempt COUNT rather than through emission: emission
+    /// is rate-limited across outages, so a test keyed on the printed line would
+    /// confuse "not counted" with "not due yet".
+    #[test]
+    fn a_rejected_bulk_is_a_failure_even_though_the_request_succeeded() {
+        let rejected = || -> Result<shipper::ShipResult> {
+            Ok(shipper::ShipResult {
+                attempted: 10,
+                succeeded: 0,
+                failed: 10,
+            })
+        };
+        let partial = || -> Result<shipper::ShipResult> {
+            Ok(shipper::ShipResult {
+                attempted: 10,
+                succeeded: 7,
+                failed: 3,
+            })
+        };
+        let clean = || -> Result<shipper::ShipResult> {
+            Ok(shipper::ShipResult {
+                attempted: 10,
+                succeeded: 10,
+                failed: 0,
+            })
+        };
+
+        let h = EsDeliveryHealth::default();
+        assert_eq!(h.outage_attempts(), None, "setup: nothing wrong yet");
+
+        h.observe(&rejected());
+        assert_eq!(
+            h.outage_attempts(),
+            Some(1),
+            "a 200-with-every-item-rejected bulk was not counted as a failed delivery"
+        );
+
+        h.observe(&partial());
+        assert_eq!(
+            h.outage_attempts(),
+            Some(2),
+            "a partially rejected bulk was not counted as a failed delivery"
+        );
+
+        h.observe(&clean());
+        assert_eq!(
+            h.outage_attempts(),
+            None,
+            "a fully successful bulk must clear the outage"
+        );
+    }
+
+    /// The rate limit must not be defeated by ALTERNATION rather than volume.
+    ///
+    /// A half-healthy endpoint — one bad backend behind a load balancer, a node
+    /// flapping 503 — fails and succeeds on alternate ticks. With the last-spoke
+    /// stamp scoped to a single outage, each new failure started a fresh outage
+    /// and warned at once, so the pair repeated every second forever and a
+    /// sustained 50% loss read as healthy.
+    #[test]
+    fn alternating_failure_and_success_cannot_flood_the_log() {
+        let h = EsDeliveryHealth::default();
+        let mut emissions = 0;
+        for second in 0..3600u64 {
+            if second % 2 == 0 {
+                if h.record_failure(T0 + second).is_some() {
+                    emissions += 1;
+                }
+            } else if h.record_success().is_some() {
+                emissions += 1;
+            }
+        }
+        // One hour of alternation, at most one failure line and one recovery line
+        // per window. The bound is absolute, not derived from the constant.
+        assert!(
+            emissions <= 150,
+            "an hour of alternating failure produced {emissions} lines; the rate limit is \
+             defeated by alternation"
+        );
+        // ...and it must not go completely silent either.
+        assert!(
+            emissions >= 2,
+            "an hour of alternating failure produced {emissions} lines; a half-healthy \
+             endpoint must not read as healthy"
+        );
+    }
+
+    #[test]
+    fn since_renders_as_rfc3339_utc() {
+        let u = EsUnreachable {
+            since_unix: T0,
+            attempts: 1,
+        };
+        let rendered = u.since_rfc3339();
+        assert!(
+            rendered.ends_with('Z') && rendered.contains('-'),
+            "unexpected rendering: {rendered}"
+        );
+    }
+
+    /// The rejected design must not come back, and partial wiring must not pass.
+    ///
+    /// A non-author review demonstrated both gaps by mutation: routing only ONE
+    /// of the seven warnings through `error_for_log` still passed the
+    /// integration test, and replacing all seven with the rejected `{:#}` passed
+    /// every test in this file too. The runtime tests cannot see the difference,
+    /// because in the fault they install the safe and unsafe renderings happen
+    /// to agree. This one looks at the wiring directly.
+    ///
+    /// It reads this file at compile time, so it holds on every platform and
+    /// under root, where the integration test cannot install its fault.
+    #[test]
+    fn every_spool_warning_is_wired_through_the_safe_renderer() {
+        let src = include_str!("main.rs");
+
+        // Key on the seven message literals, not on line shape: rustfmt wraps
+        // the longest of these calls across lines, so a line-based match missed
+        // it and reported 6 of 7 against a correct tree. Nor count occurrences
+        // of the call text, which counts this test's own source.
+        const SPOOL_WARNINGS: [&str; 7] = [
+            "Failed to ship session-start doc: ",
+            "Failed to ship game-detected doc: ",
+            "Failed to ship summary doc on game exit: ",
+            "Tick {} spool error: ",
+            "Tick {} spool rotation error: ",
+            "Failed to ship summary doc: ",
+            "Failed to finalize spool files during shutdown: ",
+        ];
+        for message in SPOOL_WARNINGS {
+            let at = src
+                .find(&format!("{message}{{}}\""))
+                .unwrap_or_else(|| panic!("warning message no longer present verbatim: {message}"));
+            // The rendered argument follows the format string; the longest of
+            // these calls spans three source lines after formatting.
+            let call = &src[at..(at + 200).min(src.len())];
+            assert!(
+                call.contains("error_for_log(&e)"),
+                "`{message}` does not render through the safe renderer: {call}"
+            );
+        }
+
+        // `{:#}` on an anyhow error prints every cause verbatim. That is the
+        // design this replaced, after it was shown to put an Elasticsearch URL
+        // and its credential, a spool path, and a forged second line on stderr.
+        for (n, line) in src.lines().enumerate() {
+            let line = line.trim_start();
+            if line.starts_with("tracing::warn!") || line.starts_with("tracing::error!") {
+                assert!(
+                    !line.contains("{:#}"),
+                    "line {} uses alternate error formatting, which prints every \
+                     cause verbatim: {line}",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// The whole point: on a full disk the errno must reach the log.
+    ///
+    /// This models the real shape — `SpoolWriter::write_docs` wraps its
+    /// `io::Error` with `.context("flushing spool writer")` — and asserts the
+    /// message an operator would actually see.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_surfaces_the_os_error() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            .context("flushing spool writer");
+
+        let rendered = error_for_log(&err);
+
+        assert_eq!(
+            rendered,
+            "flushing spool writer: No space left on device (os error 28)"
+        );
+        // The plain form, which is what these call sites used to print, does not.
+        assert_eq!(format!("{err}"), "flushing spool writer");
+    }
+
+    /// With no OS error anywhere in the chain the output must be byte-identical
+    /// to the previous behaviour. Nothing that used to be logged stops being
+    /// logged.
+    #[test]
+    fn error_for_log_is_unchanged_without_an_os_error() {
+        let err = anyhow::anyhow!("serialising spool doc").context("writing spool doc");
+        assert_eq!(error_for_log(&err), format!("{err}"));
+        assert_eq!(error_for_log(&err), "writing spool doc");
+    }
+
+    /// NEGATIVE CONTROL 1 — a URL, including a URL-borne credential, must never
+    /// reach the log.
+    ///
+    /// Four of the seven call sites also serve direct Elasticsearch delivery,
+    /// where a request failure is wrapped in the static context `sending bulk
+    /// request` over a `reqwest::Error` whose `Display` carries the URL. A
+    /// non-author review reproduced that exposure under `{:#}`. The errno must
+    /// still arrive; the URL must not.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_never_logs_a_url_or_its_credential() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))
+            .context("http://127.0.0.1:9/tenant-canary?api_key=URL_CANARY/_bulk")
+            .context("sending bulk request");
+
+        let rendered = error_for_log(&err);
+
+        assert!(
+            rendered.contains("Connection refused (os error 111)"),
+            "the errno must still be reported: {rendered}"
+        );
+        assert!(
+            !rendered.contains("URL_CANARY"),
+            "credential leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tenant-canary"),
+            "tenant path leaked: {rendered}"
+        );
+        assert!(!rendered.contains("http://"), "URL leaked: {rendered}");
+    }
+
+    /// NEGATIVE CONTROL 2 — a filesystem path carried by a cause must never
+    /// reach the log. Reproduced by the same review against the real spool
+    /// writer: `opening spool file for padding: <path>: Permission denied`.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_never_logs_a_path_from_a_cause() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES))
+            .context("opening spool file for padding: /home/PATH_CANARY/spool/x.ndjson.tmp")
+            .context("padding spool file before publication");
+
+        let rendered = error_for_log(&err);
+
+        assert!(
+            rendered.contains("Permission denied (os error 13)"),
+            "the errno must still be reported: {rendered}"
+        );
+        assert!(!rendered.contains("PATH_CANARY"), "path leaked: {rendered}");
+    }
+
+    /// NEGATIVE CONTROL 3 — a newline in a cause must never split one log event
+    /// into two.
+    ///
+    /// `anyhow` does not escape cause text and the installed tracing sanitizer
+    /// leaves newlines alone, so under `{:#}` the review planted a second line
+    /// carrying its own marker. A log line an error's content can forge is worse
+    /// than one that omits the errno.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_never_emits_a_forged_second_line() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            .context("opening spool file\nWARN rigsignal_agent: FORGED_CANARY")
+            .context("flushing spool writer");
+
+        let rendered = error_for_log(&err);
+
+        assert!(!rendered.contains('\n'), "output spans lines: {rendered:?}");
+        assert!(
+            !rendered.contains("FORGED_CANARY"),
+            "forged line leaked: {rendered}"
+        );
+        assert_eq!(
+            rendered,
+            "flushing spool writer: No space left on device (os error 28)"
+        );
+    }
+
+    /// An OS error nested deeper than the first cause is still found: the helper
+    /// walks the whole chain, it does not look only one level down.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_finds_an_os_error_deep_in_the_chain() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            .context("writing spool doc")
+            .context("dataset rigsignal.cpu")
+            .context("flushing spool writer");
+
+        assert_eq!(
+            error_for_log(&err),
+            "flushing spool writer: No space left on device (os error 28)"
+        );
+    }
+
+    /// An `io::Error` that did NOT come from the OS carries caller-supplied text,
+    /// so it must be treated as free text and omitted, not printed.
+    #[test]
+    fn error_for_log_ignores_a_non_os_io_error() {
+        let inner = std::io::Error::other("INNER_CANARY should not be logged");
+        assert!(inner.raw_os_error().is_none());
+        let err = anyhow::Error::new(inner).context("flushing spool writer");
+
+        let rendered = error_for_log(&err);
+
+        assert_eq!(rendered, "flushing spool writer");
+        assert!(
+            !rendered.contains("INNER_CANARY"),
+            "free text leaked: {rendered}"
+        );
+    }
 
     #[test]
     fn handshake_clap_surface_is_subcommand_scoped() {
