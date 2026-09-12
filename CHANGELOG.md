@@ -4,6 +4,34 @@ All notable changes to RigSignal will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+#### Fixed
+
+- **A transient Elasticsearch outage no longer becomes a crash loop.** The
+  agent's startup preflight used to abort the process when the endpoint was
+  unreachable, while the identical failure one tick later was only a warning;
+  under `Restart=on-failure` that turned a momentary outage into an endless
+  restart cycle. The preflight now warns and continues. `rigsignal setup` still
+  validates the endpoint, API key, privileges and version floor, which is where
+  a genuine misconfiguration is caught.
+- **A crash-looping agent can now reach `failed` instead of cycling forever.**
+  The agent units gained `StartLimitIntervalSec=60`: against the manager default
+  window of 10s, `RestartSec=5` fit at most two starts inside a window, so the
+  start limiter could never trip. `rigsignal start` now clears a failed state
+  before starting, and no longer reports a unit that hit the rate limit as one
+  that is not installed.
+
+#### Added
+
+- **Elasticsearch delivery health is visible without reading the journal.**
+  Every delivery-health line carries an `ES_DELIVERY` marker; a failing endpoint
+  is named once a minute for as long as it keeps failing, with the time the
+  outage began and the number of deliveries lost, and recovery is reported the
+  same way. `rigsignal status` shows the most recent such line for the current
+  boot. A bulk request that returns success while rejecting documents counts as
+  a failed delivery, not a successful one.
+
 ## [0.3.5] — 2026-09-09
 
 #### Security

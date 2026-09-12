@@ -1,6 +1,14 @@
 [Unit]
 Description=RigSignal metrics agent
 After=network.target
+# Without this the start limiter can never trip: the manager default window is
+# 10s and RestartSec=5 fits at most two starts inside it, so a crash loop runs
+# forever and the unit never reaches 'failed'. Measured on systemd 259: 45s of
+# cycling reached NRestarts=9 without tripping; at 60s it reaches 'failed' after
+# 5 restarts. Safe only because a transient Elasticsearch outage no longer
+# aborts the agent -- see the startup preflight in src/main.rs.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
