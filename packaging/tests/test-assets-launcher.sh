@@ -6,6 +6,7 @@ repo=$(cd "$repo_dir"; pwd)
 launcher="$repo/packaging/rigsignal-launcher.sh"
 corpus="$repo/packaging/tests/sidecar-verifier-corpus.tsv"
 python3 "$repo/packaging/tests/test-assets-signal-boundary.py" "$launcher"
+python3 "$repo/packaging/tests/test-assets-spawn-window.py" "$launcher"
 python3 "$repo/packaging/tests/test-assets-signal-driver.py" "$repo/packaging/tests/assets-signal-driver.py"
 python3 "$repo/packaging/tests/test-assets-signal-reporting.py" "$repo/packaging/tests/assets-signal-driver.py"
 tmp=$(mktemp -d)
@@ -332,7 +333,21 @@ run_signal_status_case TERM
 # launcher must keep the first engine status and still finish exactly once.
 mkdir -p "$tmp/cleanup-shim"
 cleanup_ready="$tmp/cleanup.ready"; cleanup_log="$tmp/cleanup.log"
-printf '%s\n' '#!/bin/sh' 'for arg in "$@"; do case "$arg" in *"/rigsignal-assets."*) if [ ! -e "$RIGSIGNAL_ASSETS_CLEANUP_READY" ]; then touch "$RIGSIGNAL_ASSETS_CLEANUP_READY"; printf "cleanup\\n" >> "$RIGSIGNAL_ASSETS_CLEANUP_LOG"; kill -INT "$PPID"; sleep 1; fi;; esac; done' 'exec /bin/rm "$@"' >"$tmp/cleanup-shim/rm"
+# The log records EVERY cleanup, not just the first.  The previous shim wrote
+# its line inside the ready-file guard, so a second cleanup produced no line at
+# all and the assertion below was structurally incapable of observing one
+# (cmt-2026-09-10-rigsignal-8-4).  One credential-bearing rm occurs per
+# cleanup -- the launcher's credential is mktemp'd inside the private assets
+# directory -- so counting those lines counts cleanups.  The second signal is
+# still delivered only once; that is what the ready file is for.
+printf '%s\n' '#!/bin/sh' \
+    '_assets=0; _credential=0' \
+    'for arg in "$@"; do case "$arg" in *"/rigsignal-assets."*"/admin."*) _credential=1; _assets=1;; *"/rigsignal-assets."*) _assets=1;; esac; done' \
+    'if [ "$_assets" = 1 ]; then' \
+    '  if [ "$_credential" = 1 ]; then printf "cleanup\\n" >> "$RIGSIGNAL_ASSETS_CLEANUP_LOG"; else printf "cleanup-tail\\n" >> "$RIGSIGNAL_ASSETS_CLEANUP_LOG"; fi' \
+    '  if [ ! -e "$RIGSIGNAL_ASSETS_CLEANUP_READY" ]; then touch "$RIGSIGNAL_ASSETS_CLEANUP_READY"; kill -INT "$PPID"; sleep 1; fi' \
+    'fi' \
+    'exec /bin/rm "$@"' >"$tmp/cleanup-shim/rm"
 chmod 755 "$tmp/cleanup-shim/rm"
 second_ready="$tmp/second.ready"; second_seen="$tmp/second.seen"; second_result="$tmp/second.result"
 rm -f "$cleanup_ready" "$cleanup_log" "$second_ready" "$second_seen" "$second_result"
@@ -341,6 +356,14 @@ HOME="$home" XDG_CONFIG_HOME="$home/.config" TMPDIR="$tmp/runtime" PATH="$tmp/cl
 require_line status=42 "$second_result" "second signal during cleanup preserved engine status"
 require_line SIGTERM "$second_seen" "first signal was not forwarded before cleanup"
 require_line cleanup "$cleanup_log" "second-signal fixture did not observe cleanup"
+# "still finish exactly once", asserted rather than assumed.  The interrupt
+# handler enables errexit before tearing down, and cleanup returns the engine's
+# status, so a nonzero status used to end the shell before the EXIT trap was
+# retired and cleanup ran a second time.
+cleanup_calls=$(grep -cx cleanup "$cleanup_log" || true)
+if [ "$cleanup_calls" -ne 1 ]; then
+    fail "cleanup ran $cleanup_calls times on the nonzero-status path, expected exactly 1"
+fi
 require_missing_match "$tmp/runtime" 'rigsignal-assets.*' "second signal during cleanup left the private assets directory"
 
 # A real pseudo-terminal proves echo is restored after an interrupt between

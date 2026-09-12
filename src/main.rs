@@ -1287,7 +1287,7 @@ async fn run() -> Result<ExitCode> {
     // Ship session-start document
     let start_doc = build_session_start_doc(&session, &host_snapshot, &hostname);
     if let Err(e) = write_output(&cfg, &mut spool_writer, vec![start_doc], &es_health).await {
-        tracing::warn!("Failed to ship session-start doc: {}", e);
+        tracing::warn!("Failed to ship session-start doc: {}", error_for_log(&e));
     }
 
     // Signal handlers — spawned watcher sends on a oneshot so the select! arm
@@ -1382,7 +1382,7 @@ async fn run() -> Result<ExitCode> {
                             &session, &host_snapshot, &hostname, &target,
                         );
                         if let Err(e) = write_output(&cfg, &mut spool_writer, vec![game_doc], &es_health).await {
-                            tracing::warn!("Failed to ship game-detected doc: {}", e);
+                            tracing::warn!("Failed to ship game-detected doc: {}", error_for_log(&e));
                         }
                     }
                     SessionEvent::GameEnded(target) => {
@@ -1408,7 +1408,7 @@ async fn run() -> Result<ExitCode> {
                                 duration_s, session_tick
                             );
                             if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc], &es_health).await {
-                                tracing::warn!("Failed to ship summary doc on game exit: {}", e);
+                                tracing::warn!("Failed to ship summary doc on game exit: {}", error_for_log(&e));
                             } else if matches!(cfg.output.mode, OutputMode::Elasticsearch) {
                                 if let Err(e) = shipper::trigger_transform_sync(&cfg, "rigsignal-game-timeline").await {
                                     tracing::warn!("transform schedule_now failed (non-fatal): {}", e);
@@ -1525,7 +1525,7 @@ async fn run() -> Result<ExitCode> {
                             }
                         });
                     } else if let Err(e) = write_output(&cfg, &mut spool_writer, tick_docs, &es_health).await {
-                        tracing::warn!("Tick {} spool error: {}", tick_num, e);
+                        tracing::warn!("Tick {} spool error: {}", tick_num, error_for_log(&e));
                     } else {
                         tracing::debug!("Tick {}: spooled {} docs", tick_num, n);
                     }
@@ -1533,7 +1533,7 @@ async fn run() -> Result<ExitCode> {
 
                 if let Some(writer) = spool_writer.as_mut() {
                     if let Err(e) = writer.rotate_stale_files() {
-                        tracing::warn!("Tick {} spool rotation error: {}", tick, e);
+                        tracing::warn!("Tick {} spool rotation error: {}", tick, error_for_log(&e));
                     }
                 }
             }
@@ -1564,7 +1564,7 @@ async fn run() -> Result<ExitCode> {
             session_tick
         );
         if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc], &es_health).await {
-            tracing::warn!("Failed to ship summary doc: {}", e);
+            tracing::warn!("Failed to ship summary doc: {}", error_for_log(&e));
         } else {
             summary_written = true;
         }
@@ -1581,7 +1581,10 @@ async fn run() -> Result<ExitCode> {
     // write must never strand already-buffered metric batches at shutdown.
     if let Some(writer) = spool_writer.as_mut() {
         if let Err(e) = writer.finalize_all() {
-            tracing::warn!("Failed to finalize spool files during shutdown: {}", e);
+            tracing::warn!(
+                "Failed to finalize spool files during shutdown: {}",
+                error_for_log(&e)
+            );
         }
     }
 
@@ -1616,6 +1619,48 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
     } else {
         Ok(())
     }
+}
+
+/// Render an error for an operator log: the error's own message, plus the OS
+/// error code and its strerror text when one is anywhere in the cause chain,
+/// and nothing else.
+///
+/// Why this exists, and why it is not simply `{:#}`. On a full disk the spool
+/// warnings printed only `flushing spool writer` — the errno never reached the
+/// log, because `anyhow` shows the cause chain only under the alternate format.
+/// Switching those warnings to `{:#}` does surface the errno, but it also
+/// surfaces every other cause verbatim, and a non-author review reproduced three
+/// consequences of that: the Elasticsearch URL including a URL-borne credential
+/// (four of these call sites also serve direct delivery, where a request failure
+/// is wrapped in a static context over a `reqwest::Error`), a spool file path,
+/// and a cause containing a newline splitting one log event into two.
+///
+/// So this takes the errno and refuses the free text. An `io::Error` returns
+/// `Some` from `raw_os_error()` only when it holds the OS representation, and
+/// that representation's `Display` is the platform error string plus the number
+/// — there is no slot in it for caller-supplied text. That is the property being
+/// relied on. It is NOT a claim that a syscall produced the value:
+/// `from_raw_os_error` lets a caller choose the number. Choosing a misleading
+/// errno is a far smaller problem than echoing an arbitrary string, which is the
+/// trade this makes. When no OS error is in the chain the output is
+/// byte-identical to the previous `{}` behaviour, so nothing that used to be
+/// logged stops being logged.
+fn error_for_log(err: &anyhow::Error) -> String {
+    for (depth, cause) in err.chain().enumerate() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.raw_os_error().is_some() {
+                // At depth 0 the error IS the OS error, so its own Display is
+                // already the message; appending would print it twice. Reachable:
+                // a failed removal of an empty replacement file propagates a bare
+                // io::Error with no context.
+                if depth == 0 {
+                    return format!("{err}");
+                }
+                return format!("{err}: {io_err}");
+            }
+        }
+    }
+    format!("{err}")
 }
 
 #[cfg(test)]
@@ -1917,6 +1962,205 @@ mod tests {
         assert!(
             rendered.ends_with('Z') && rendered.contains('-'),
             "unexpected rendering: {rendered}"
+        );
+    }
+
+    /// The rejected design must not come back, and partial wiring must not pass.
+    ///
+    /// A non-author review demonstrated both gaps by mutation: routing only ONE
+    /// of the seven warnings through `error_for_log` still passed the
+    /// integration test, and replacing all seven with the rejected `{:#}` passed
+    /// every test in this file too. The runtime tests cannot see the difference,
+    /// because in the fault they install the safe and unsafe renderings happen
+    /// to agree. This one looks at the wiring directly.
+    ///
+    /// It reads this file at compile time, so it holds on every platform and
+    /// under root, where the integration test cannot install its fault.
+    #[test]
+    fn every_spool_warning_is_wired_through_the_safe_renderer() {
+        let src = include_str!("main.rs");
+
+        // Key on the seven message literals, not on line shape: rustfmt wraps
+        // the longest of these calls across lines, so a line-based match missed
+        // it and reported 6 of 7 against a correct tree. Nor count occurrences
+        // of the call text, which counts this test's own source.
+        const SPOOL_WARNINGS: [&str; 7] = [
+            "Failed to ship session-start doc: ",
+            "Failed to ship game-detected doc: ",
+            "Failed to ship summary doc on game exit: ",
+            "Tick {} spool error: ",
+            "Tick {} spool rotation error: ",
+            "Failed to ship summary doc: ",
+            "Failed to finalize spool files during shutdown: ",
+        ];
+        for message in SPOOL_WARNINGS {
+            let at = src
+                .find(&format!("{message}{{}}\""))
+                .unwrap_or_else(|| panic!("warning message no longer present verbatim: {message}"));
+            // The rendered argument follows the format string; the longest of
+            // these calls spans three source lines after formatting.
+            let call = &src[at..(at + 200).min(src.len())];
+            assert!(
+                call.contains("error_for_log(&e)"),
+                "`{message}` does not render through the safe renderer: {call}"
+            );
+        }
+
+        // `{:#}` on an anyhow error prints every cause verbatim. That is the
+        // design this replaced, after it was shown to put an Elasticsearch URL
+        // and its credential, a spool path, and a forged second line on stderr.
+        for (n, line) in src.lines().enumerate() {
+            let line = line.trim_start();
+            if line.starts_with("tracing::warn!") || line.starts_with("tracing::error!") {
+                assert!(
+                    !line.contains("{:#}"),
+                    "line {} uses alternate error formatting, which prints every \
+                     cause verbatim: {line}",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// The whole point: on a full disk the errno must reach the log.
+    ///
+    /// This models the real shape — `SpoolWriter::write_docs` wraps its
+    /// `io::Error` with `.context("flushing spool writer")` — and asserts the
+    /// message an operator would actually see.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_surfaces_the_os_error() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            .context("flushing spool writer");
+
+        let rendered = error_for_log(&err);
+
+        assert_eq!(
+            rendered,
+            "flushing spool writer: No space left on device (os error 28)"
+        );
+        // The plain form, which is what these call sites used to print, does not.
+        assert_eq!(format!("{err}"), "flushing spool writer");
+    }
+
+    /// With no OS error anywhere in the chain the output must be byte-identical
+    /// to the previous behaviour. Nothing that used to be logged stops being
+    /// logged.
+    #[test]
+    fn error_for_log_is_unchanged_without_an_os_error() {
+        let err = anyhow::anyhow!("serialising spool doc").context("writing spool doc");
+        assert_eq!(error_for_log(&err), format!("{err}"));
+        assert_eq!(error_for_log(&err), "writing spool doc");
+    }
+
+    /// NEGATIVE CONTROL 1 — a URL, including a URL-borne credential, must never
+    /// reach the log.
+    ///
+    /// Four of the seven call sites also serve direct Elasticsearch delivery,
+    /// where a request failure is wrapped in the static context `sending bulk
+    /// request` over a `reqwest::Error` whose `Display` carries the URL. A
+    /// non-author review reproduced that exposure under `{:#}`. The errno must
+    /// still arrive; the URL must not.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_never_logs_a_url_or_its_credential() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))
+            .context("http://127.0.0.1:9/tenant-canary?api_key=URL_CANARY/_bulk")
+            .context("sending bulk request");
+
+        let rendered = error_for_log(&err);
+
+        assert!(
+            rendered.contains("Connection refused (os error 111)"),
+            "the errno must still be reported: {rendered}"
+        );
+        assert!(
+            !rendered.contains("URL_CANARY"),
+            "credential leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tenant-canary"),
+            "tenant path leaked: {rendered}"
+        );
+        assert!(!rendered.contains("http://"), "URL leaked: {rendered}");
+    }
+
+    /// NEGATIVE CONTROL 2 — a filesystem path carried by a cause must never
+    /// reach the log. Reproduced by the same review against the real spool
+    /// writer: `opening spool file for padding: <path>: Permission denied`.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_never_logs_a_path_from_a_cause() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES))
+            .context("opening spool file for padding: /home/PATH_CANARY/spool/x.ndjson.tmp")
+            .context("padding spool file before publication");
+
+        let rendered = error_for_log(&err);
+
+        assert!(
+            rendered.contains("Permission denied (os error 13)"),
+            "the errno must still be reported: {rendered}"
+        );
+        assert!(!rendered.contains("PATH_CANARY"), "path leaked: {rendered}");
+    }
+
+    /// NEGATIVE CONTROL 3 — a newline in a cause must never split one log event
+    /// into two.
+    ///
+    /// `anyhow` does not escape cause text and the installed tracing sanitizer
+    /// leaves newlines alone, so under `{:#}` the review planted a second line
+    /// carrying its own marker. A log line an error's content can forge is worse
+    /// than one that omits the errno.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_never_emits_a_forged_second_line() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            .context("opening spool file\nWARN rigsignal_agent: FORGED_CANARY")
+            .context("flushing spool writer");
+
+        let rendered = error_for_log(&err);
+
+        assert!(!rendered.contains('\n'), "output spans lines: {rendered:?}");
+        assert!(
+            !rendered.contains("FORGED_CANARY"),
+            "forged line leaked: {rendered}"
+        );
+        assert_eq!(
+            rendered,
+            "flushing spool writer: No space left on device (os error 28)"
+        );
+    }
+
+    /// An OS error nested deeper than the first cause is still found: the helper
+    /// walks the whole chain, it does not look only one level down.
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_finds_an_os_error_deep_in_the_chain() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            .context("writing spool doc")
+            .context("dataset rigsignal.cpu")
+            .context("flushing spool writer");
+
+        assert_eq!(
+            error_for_log(&err),
+            "flushing spool writer: No space left on device (os error 28)"
+        );
+    }
+
+    /// An `io::Error` that did NOT come from the OS carries caller-supplied text,
+    /// so it must be treated as free text and omitted, not printed.
+    #[test]
+    fn error_for_log_ignores_a_non_os_io_error() {
+        let inner = std::io::Error::other("INNER_CANARY should not be logged");
+        assert!(inner.raw_os_error().is_none());
+        let err = anyhow::Error::new(inner).context("flushing spool writer");
+
+        let rendered = error_for_log(&err);
+
+        assert_eq!(rendered, "flushing spool writer");
+        assert!(
+            !rendered.contains("INNER_CANARY"),
+            "free text leaked: {rendered}"
         );
     }
 
