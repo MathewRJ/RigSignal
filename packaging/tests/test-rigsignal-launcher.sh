@@ -506,26 +506,6 @@ echo $((n + 1)) > "$RS_TEST_STATE/sleeps"
 exit 0
 SH
 
-# Coverage, MEASURED by mutating one statement of the fix at a time and running
-# each scenario ALONE (the suite stops at its first failure, so a whole-suite run
-# credits scenarios that never executed). CATCH = that scenario goes red.
-#
-#   mutation                           healthy fastloop slowfail twotick norestarts latestart
-#   streak -ge 3 -> -ge 2                 .       .      CATCH    CATCH      .         .
-#   restart-counter check deleted         .       .      CATCH      .        .         .
-#   counter fail-closed when absent       .       .        .        .      CATCH       .
-#   poll bound -lt 12 -> -lt 10           .       .        .        .        .       CATCH
-#   exit status reverted to always 0      .     CATCH    CATCH    CATCH      .         .
-#   whole fix reverted                  CATCH   CATCH    CATCH    CATCH    CATCH       .
-#
-# Read it this way: twotick is what pins the sample count at three rather than
-# two -- fastloop's active window is one sample wide and cannot tell those
-# apart, so without twotick the constant would be unguarded. slowfail catches a
-# weakened streak as well as a deleted counter, because the counter can only
-# observe a restart if the loop is still sampling when it happens; the two
-# halves are not independent. latestart is the only guard on the poll bound, and
-# it does not catch a full revert -- correctly, since the old code accepted a
-# slow start too.
 cat > "$start_tmp/bin/systemctl" <<'SH'
 #!/bin/sh
 t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
