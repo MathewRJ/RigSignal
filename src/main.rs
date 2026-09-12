@@ -1060,7 +1060,7 @@ async fn run() -> Result<ExitCode> {
     // Ship session-start document
     let start_doc = build_session_start_doc(&session, &host_snapshot, &hostname);
     if let Err(e) = write_output(&cfg, &mut spool_writer, vec![start_doc]).await {
-        tracing::warn!("Failed to ship session-start doc: {}", e);
+        tracing::warn!("Failed to ship session-start doc: {:#}", e);
     }
 
     // Signal handlers — spawned watcher sends on a oneshot so the select! arm
@@ -1155,7 +1155,7 @@ async fn run() -> Result<ExitCode> {
                             &session, &host_snapshot, &hostname, &target,
                         );
                         if let Err(e) = write_output(&cfg, &mut spool_writer, vec![game_doc]).await {
-                            tracing::warn!("Failed to ship game-detected doc: {}", e);
+                            tracing::warn!("Failed to ship game-detected doc: {:#}", e);
                         }
                     }
                     SessionEvent::GameEnded(target) => {
@@ -1181,7 +1181,7 @@ async fn run() -> Result<ExitCode> {
                                 duration_s, session_tick
                             );
                             if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc]).await {
-                                tracing::warn!("Failed to ship summary doc on game exit: {}", e);
+                                tracing::warn!("Failed to ship summary doc on game exit: {:#}", e);
                             } else if matches!(cfg.output.mode, OutputMode::Elasticsearch) {
                                 if let Err(e) = shipper::trigger_transform_sync(&cfg, "rigsignal-game-timeline").await {
                                     tracing::warn!("transform schedule_now failed (non-fatal): {}", e);
@@ -1293,7 +1293,7 @@ async fn run() -> Result<ExitCode> {
                             }
                         });
                     } else if let Err(e) = write_output(&cfg, &mut spool_writer, tick_docs).await {
-                        tracing::warn!("Tick {} spool error: {}", tick_num, e);
+                        tracing::warn!("Tick {} spool error: {:#}", tick_num, e);
                     } else {
                         tracing::debug!("Tick {}: spooled {} docs", tick_num, n);
                     }
@@ -1301,7 +1301,7 @@ async fn run() -> Result<ExitCode> {
 
                 if let Some(writer) = spool_writer.as_mut() {
                     if let Err(e) = writer.rotate_stale_files() {
-                        tracing::warn!("Tick {} spool rotation error: {}", tick, e);
+                        tracing::warn!("Tick {} spool rotation error: {:#}", tick, e);
                     }
                 }
             }
@@ -1332,7 +1332,7 @@ async fn run() -> Result<ExitCode> {
             session_tick
         );
         if let Err(e) = write_output(&cfg, &mut spool_writer, vec![summary_doc]).await {
-            tracing::warn!("Failed to ship summary doc: {}", e);
+            tracing::warn!("Failed to ship summary doc: {:#}", e);
         } else {
             summary_written = true;
         }
@@ -1349,7 +1349,7 @@ async fn run() -> Result<ExitCode> {
     // write must never strand already-buffered metric batches at shutdown.
     if let Some(writer) = spool_writer.as_mut() {
         if let Err(e) = writer.finalize_all() {
-            tracing::warn!("Failed to finalize spool files during shutdown: {}", e);
+            tracing::warn!("Failed to finalize spool files during shutdown: {:#}", e);
         }
     }
 
@@ -1389,6 +1389,53 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spool write that fails because the disk is full must say so in the log.
+    ///
+    /// The spool writer wraps its io::Error with `.context("flushing spool writer")`
+    /// (src/shipper.rs). `anyhow` prints only the outermost context for ordinary
+    /// Display, and the cause chain -- which is where the errno lives -- only for
+    /// the alternate form. Formatting those warnings with `{}` therefore produced
+    /// `Tick 1 spool error: flushing spool writer` on a full disk, with no errno
+    /// and no "No space left on device" anywhere in the log. That was measured
+    /// against a running agent, not inferred.
+    ///
+    /// WHAT THIS TEST PINS, precisely: the formatting mechanism and the error
+    /// shape the spool path actually produces. It does NOT reach the seven
+    /// `tracing::warn!` call sites in `run()`, which live inside a long async
+    /// function with no seam to call them from a test. Reintroducing `{}` at a
+    /// call site would not turn this test red. The call-site evidence is the
+    /// measured run recorded in the P0 ENOSPC package; this test guards the
+    /// reason the change is correct, and that is the honest extent of it.
+    /// Unix-gated: `libc` is a `cfg(unix)` dependency here and the strerror text
+    /// asserted below is a Unix string. This crate also builds for Windows.
+    #[cfg(unix)]
+    #[test]
+    fn enospc_cause_chain_survives_alternate_formatting() {
+        let io_err = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let wrapped: anyhow::Error = anyhow::Error::new(io_err).context("flushing spool writer");
+
+        let plain = format!("{}", wrapped);
+        let alternate = format!("{:#}", wrapped);
+
+        // The defect: ordinary Display discards the cause, so an operator staring
+        // at a full disk is told only that a flush failed.
+        assert_eq!(plain, "flushing spool writer");
+        assert!(
+            !plain.contains("No space left on device"),
+            "plain Display unexpectedly carried the cause: {plain}"
+        );
+
+        // The fix: the alternate form keeps the chain, so the errno reaches the log.
+        assert!(
+            alternate.contains("flushing spool writer"),
+            "alternate form lost the context: {alternate}"
+        );
+        assert!(
+            alternate.contains("No space left on device"),
+            "alternate form did not name the ENOSPC cause: {alternate}"
+        );
+    }
 
     #[test]
     fn handshake_clap_surface_is_subcommand_scoped() {
