@@ -1977,13 +1977,105 @@ mod tests {
     /// It reads this file at compile time, so it holds on every platform and
     /// under root, where the integration test cannot install its fault.
     #[test]
-    fn every_spool_warning_is_wired_through_the_safe_renderer() {
-        let src = include_str!("main.rs");
+    fn every_warning_is_routed_or_allowlisted() {
+        let all = include_str!("main.rs");
+        // Exclude this test module: its own source quotes the very literals and
+        // macro names being scanned for, and counting those would let the guard
+        // satisfy itself.
+        let src = &all[..all.find("\n#[cfg(test)]\n").expect("test module marker")];
 
-        // Key on the seven message literals, not on line shape: rustfmt wraps
-        // the longest of these calls across lines, so a line-based match missed
-        // it and reported 6 of 7 against a correct tree. Nor count occurrences
-        // of the call text, which counts this test's own source.
+        // ── Precondition: the RECOGNISER must be complete ────────────────────
+        // Everything below finds call sites by the text `tracing::warn!` /
+        // `tracing::error!`. If the macros are ever imported unqualified, a bare
+        // `warn!(..)` becomes invisible and this guard silently stops covering
+        // it while still passing. That is the failure mode an incomplete
+        // recogniser always has, so it is asserted rather than assumed.
+        for bad in ["use tracing::warn", "use tracing::error", "use tracing::{"] {
+            assert!(
+                !src.contains(bad),
+                "`{bad}` makes unqualified `warn!`/`error!` possible, which this \
+                 guard cannot see. Either keep the macros fully qualified or teach \
+                 the scan the unqualified form BEFORE landing that import."
+            );
+        }
+
+        // ── Enumerate EVERY call site, wherever it sits on its line ──────────
+        // The previous revision keyed leg 2 on `line.starts_with(..)`, so any
+        // call that did not begin its line was unguarded -- measured: 2 of 23
+        // real sites, and a leak reintroduced in the multi-line form rustfmt
+        // produces passed the whole unit suite. Position is not a property of
+        // the code, only of its formatting.
+        let sites = warning_call_sites(src);
+        assert!(
+            sites.len() >= 20,
+            "found only {} warning sites; the scan is broken and every check \
+             below would pass vacuously",
+            sites.len()
+        );
+
+        // ── Each site must be accounted for, by ROUTING or by ALLOWLIST ──────
+        // Inverted from the previous revision, which enumerated seven GOOD sites
+        // and therefore could not see an eighth. This enumerates the sites and
+        // demands each be classified, so a NEW warning fails until someone says
+        // which it is. Allowlisted entries are those that render no error value.
+        const RENDERS_NO_ERROR: [&str; 7] = [
+            "Elasticsearch delivery failing since",
+            "Elasticsearch delivery recovered after",
+            "startup preflight failed",
+            "User-specified target not found",
+            "remote_connections tailer disabled: direct Elasticsearch endpoint",
+            "remote_connections bulk batch retained for replay",
+            "docs failed",
+        ];
+        // Sites that DO render an error but deliberately not through the safe
+        // renderer, each because its outermost context is a static literal --
+        // which is exactly the precondition `error_for_log` documents and relies
+        // on. Adding a site here is a claim about the error's OUTERMOST layer,
+        // not about the call.
+        const STATIC_OUTERMOST_CONTEXT: [&str; 7] = [
+            "Elasticsearch startup preflight error",
+            "remote_connections tailer disabled during startup",
+            "transform schedule_now failed (non-fatal)",
+            "remote_connections checkpoint acknowledgement failed",
+            "remote_connections bulk transport error",
+            "remote_connections tail error",
+            "Tick {} bulk error",
+        ];
+
+        let mut unclassified = Vec::new();
+        for (line_no, body) in &sites {
+            let routed = body.contains("error_for_log(");
+            let known = RENDERS_NO_ERROR
+                .iter()
+                .chain(STATIC_OUTERMOST_CONTEXT.iter());
+            let listed = known.clone().any(|m| body.contains(m)) || body.contains("{} error: {}");
+            if !routed && !listed {
+                unclassified.push(format!("line {line_no}: {body}"));
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "warning site(s) render an error through neither the safe renderer \
+             nor a declared exemption. Route through `error_for_log`, or add the \
+             message to one of the tables above WITH the reason it is safe:\n{}",
+            unclassified.join("\n")
+        );
+
+        // ── No alternate formatting, at ANY position ─────────────────────────
+        // `{:#}` on an anyhow error prints every cause verbatim. That is the
+        // design this replaced, after it was shown to put an Elasticsearch URL
+        // and its credential, a spool path, and a forged second line on stderr.
+        for (line_no, body) in &sites {
+            assert!(
+                !body.contains("{:#}"),
+                "line {line_no} uses alternate error formatting, which prints \
+                 every cause verbatim: {body}"
+            );
+        }
+
+        // ── The seven spool warnings specifically must stay routed ───────────
+        // Kept from the previous revision: these are the sites whose errors carry
+        // an errno that must reach the log, so routing is required, not optional.
         const SPOOL_WARNINGS: [&str; 7] = [
             "Failed to ship session-start doc: ",
             "Failed to ship game-detected doc: ",
@@ -1994,32 +2086,75 @@ mod tests {
             "Failed to finalize spool files during shutdown: ",
         ];
         for message in SPOOL_WARNINGS {
-            let at = src
-                .find(&format!("{message}{{}}\""))
-                .unwrap_or_else(|| panic!("warning message no longer present verbatim: {message}"));
-            // The rendered argument follows the format string; the longest of
-            // these calls spans three source lines after formatting.
-            let call = &src[at..(at + 200).min(src.len())];
+            let site = sites
+                .iter()
+                .find(|(_, body)| body.contains(message))
+                .unwrap_or_else(|| panic!("warning message no longer present: {message}"));
             assert!(
-                call.contains("error_for_log(&e)"),
-                "`{message}` does not render through the safe renderer: {call}"
+                site.1.contains("error_for_log(&e)"),
+                "`{message}` does not render through the safe renderer: {}",
+                site.1
             );
         }
+    }
 
-        // `{:#}` on an anyhow error prints every cause verbatim. That is the
-        // design this replaced, after it was shown to put an Elasticsearch URL
-        // and its credential, a spool path, and a forged second line on stderr.
-        for (n, line) in src.lines().enumerate() {
-            let line = line.trim_start();
-            if line.starts_with("tracing::warn!") || line.starts_with("tracing::error!") {
-                assert!(
-                    !line.contains("{:#}"),
-                    "line {} uses alternate error formatting, which prints every \
-                     cause verbatim: {line}",
-                    n + 1
-                );
+    /// Every `tracing::warn!`/`error!` call in `src`, as `(line number, argument text)`.
+    ///
+    /// Finds calls by position-independent search and delimits each by a
+    /// STRING-AWARE balanced-paren scan. Both properties are load-bearing:
+    /// a line-anchored search misses a wrapped call, and a naive paren count
+    /// terminates early on a message that contains a parenthesis -- which one of
+    /// these messages, "transform schedule_now failed (non-fatal)", actually does.
+    fn warning_call_sites(src: &str) -> Vec<(usize, String)> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        for pat in ["tracing::warn!", "tracing::error!"] {
+            let mut from = 0;
+            while let Some(rel) = src[from..].find(pat) {
+                let at = from + rel;
+                from = at + pat.len();
+                let Some(open) = src[at..].find('(').map(|o| at + o) else {
+                    continue;
+                };
+                let mut depth = 0usize;
+                let mut in_str = false;
+                let mut escaped = false;
+                let mut end = None;
+                for (k, &byte) in bytes.iter().enumerate().skip(open) {
+                    let c = byte as char;
+                    if in_str {
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            in_str = false;
+                        }
+                        continue;
+                    }
+                    match c {
+                        '"' => in_str = true,
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(end) = end else { continue };
+                let line_no = src[..at].matches('\n').count() + 1;
+                let body: String = src[open + 1..end]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push((line_no, body));
             }
         }
+        out
     }
 
     /// The whole point: on a full disk the errno must reach the log.
