@@ -1814,7 +1814,10 @@ mod tests {
         let rendered = format!("{err}");
 
         // endpoint_origin REJECTS this endpoint, so no origin is named at all.
-        assert_eq!(rendered, "connecting to Elasticsearch", "rendered: {rendered}");
+        assert_eq!(
+            rendered, "connecting to Elasticsearch",
+            "rendered: {rendered}"
+        );
         // Belt and braces on the specific secrets, so a future rewording that
         // reintroduced the endpoint could not pass by changing the prefix.
         for secret in ["hunter2", "SEKRIT", "spooky", "@"] {
@@ -1827,10 +1830,8 @@ mod tests {
     /// would satisfy the leak test while destroying the diagnostic.
     #[tokio::test]
     async fn ping_error_context_still_names_a_clean_endpoint() {
-        let cfg: Config = toml::from_str(
-            "[elasticsearch]\nendpoint = \"http://127.0.0.1:9\"\n",
-        )
-        .expect("config parses");
+        let cfg: Config = toml::from_str("[elasticsearch]\nendpoint = \"http://127.0.0.1:9\"\n")
+            .expect("config parses");
 
         let err = ping(&cfg).await.expect_err("port 9 must not answer");
         assert_eq!(

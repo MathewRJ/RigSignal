@@ -581,11 +581,26 @@ fn affinity_pair(uuid: Option<String>, pending: Option<bool>) -> Result<Option<A
 }
 /// Reduce an endpoint to a bare `scheme://host[:port]` origin, or `None`.
 ///
-/// REJECTS rather than sanitises: any userinfo, username, password, query,
-/// fragment or non-root path yields `None`. That is why it is safe to render
-/// into an error message -- there is no list of credential-bearing forms to keep
-/// complete, because anything unusual fails closed instead of being stripped.
-/// Also used by `shipper::ping` for exactly that property.
+/// REJECTS rather than sanitises: userinfo, a username, a password, a query, a
+/// fragment, a non-`http(s)` scheme or a path that does not NORMALISE to empty
+/// or `/` all yield `None`. Note the word normalise: `http://host/SECRET/..`
+/// collapses to `/` and is accepted, returning `http://host` -- the segment is
+/// dropped, not echoed, so this is safe, but the guarantee is "the output is
+/// assembled only from scheme, host and port", NOT "any input with a path is
+/// refused". Stating the weaker, true property matters here because this
+/// codebase has twice been bitten by a safety-named helper whose doc promised
+/// more than its code (`error_for_log`, `redacted_for_display`).
+///
+/// TWO CONSUMERS WITH OPPOSITE FAILURE PREFERENCES -- read before relaxing or
+/// tightening this:
+///   - `preflight` (this file) treats `None` as FATAL: it is a validator there, and
+///     relaxing this function to be more permissive silently widens what the
+///     handshake accepts.
+///   - `shipper::ping` treats `None` as "say nothing": it is a redactor there,
+///     and tightening this function costs only diagnostic detail in a log line.
+///
+/// A change that looks like an improvement for one is a regression for the
+/// other, so change it for a stated reason and check both call sites.
 pub(crate) fn endpoint_origin(value: &str) -> Option<String> {
     let url = reqwest::Url::parse(value).ok()?;
     if !matches!(url.scheme(), "http" | "https")
