@@ -889,7 +889,25 @@ pub async fn ping(config: &Config) -> Result<()> {
     let resp = req
         .send()
         .await
-        .with_context(|| format!("connecting to Elasticsearch at {}", endpoint))?;
+        // The outermost context is what `{}` on an anyhow::Error renders, and this
+        // error reaches the journal through main's startup-preflight warning. The
+        // configured endpoint is an unvalidated bare String, so it can carry
+        // `user:pass@` or a credential-bearing query parameter -- interpolating it
+        // raw put that in the log.
+        //
+        // Routing the LOG SITE through `error_for_log` would not have fixed this:
+        // that helper renders `{err}`, which IS the outermost context, so the
+        // endpoint would survive laundered through the helper named for safety.
+        // Its doc comment's "wrapped in a static context" is a precondition, and
+        // this call site was the one violating it. The fix therefore belongs here.
+        //
+        // `endpoint_origin` REJECTS anything carrying credentials rather than
+        // stripping them, so an endpoint that cannot be proven credential-free is
+        // omitted entirely instead of being partially scrubbed.
+        .with_context(|| match crate::handshake::endpoint_origin(endpoint) {
+            Some(origin) => format!("connecting to Elasticsearch at {origin}"),
+            None => "connecting to Elasticsearch".to_string(),
+        })?;
 
     let status = resp.status();
     // 401 = wrong key (endpoint alive). 403 = key exists but missing privilege.
@@ -1772,5 +1790,52 @@ mod tests {
         }
         paths.sort();
         Ok(paths)
+    }
+
+    /// F1: the ping error reaches the journal via main's startup-preflight warning,
+    /// so its OUTERMOST context must never carry a credential.
+    ///
+    /// Both cases assert the message EXACTLY rather than asserting an absence.
+    /// An absence assertion ("does not contain the password") passes for any error
+    /// at all -- including one raised before `send()` is ever reached, where the
+    /// context under test never runs. Pinning the exact string means the test fails
+    /// if the error stops coming from this call site, which is the setup the test
+    /// depends on and therefore the thing it has to check.
+    #[tokio::test]
+    async fn ping_error_context_omits_a_credential_bearing_endpoint() {
+        // Userinfo AND a credential-bearing query parameter. Port 9 is discard:
+        // nothing answers, so `send()` fails and the context under test renders.
+        let cfg: Config = toml::from_str(
+            "[elasticsearch]\nendpoint = \"http://spooky:hunter2@127.0.0.1:9/?api_key=SEKRIT\"\n",
+        )
+        .expect("config parses");
+
+        let err = ping(&cfg).await.expect_err("port 9 must not answer");
+        let rendered = format!("{err}");
+
+        // endpoint_origin REJECTS this endpoint, so no origin is named at all.
+        assert_eq!(rendered, "connecting to Elasticsearch", "rendered: {rendered}");
+        // Belt and braces on the specific secrets, so a future rewording that
+        // reintroduced the endpoint could not pass by changing the prefix.
+        for secret in ["hunter2", "SEKRIT", "spooky", "@"] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+    }
+
+    /// The counterpart, and the reason the test above cannot pass vacuously:
+    /// a credential-free endpoint MUST still be named, or "omit everything"
+    /// would satisfy the leak test while destroying the diagnostic.
+    #[tokio::test]
+    async fn ping_error_context_still_names_a_clean_endpoint() {
+        let cfg: Config = toml::from_str(
+            "[elasticsearch]\nendpoint = \"http://127.0.0.1:9\"\n",
+        )
+        .expect("config parses");
+
+        let err = ping(&cfg).await.expect_err("port 9 must not answer");
+        assert_eq!(
+            format!("{err}"),
+            "connecting to Elasticsearch at http://127.0.0.1:9"
+        );
     }
 }

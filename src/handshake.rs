@@ -579,7 +579,14 @@ fn affinity_pair(uuid: Option<String>, pending: Option<bool>) -> Result<Option<A
         (None, None) => Ok(None),
     }
 }
-fn endpoint_origin(value: &str) -> Option<String> {
+/// Reduce an endpoint to a bare `scheme://host[:port]` origin, or `None`.
+///
+/// REJECTS rather than sanitises: any userinfo, username, password, query,
+/// fragment or non-root path yields `None`. That is why it is safe to render
+/// into an error message -- there is no list of credential-bearing forms to keep
+/// complete, because anything unusual fails closed instead of being stripped.
+/// Also used by `shipper::ping` for exactly that property.
+pub(crate) fn endpoint_origin(value: &str) -> Option<String> {
     let url = reqwest::Url::parse(value).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
