@@ -1990,11 +1990,25 @@ mod tests {
     /// under root, where the integration test cannot install its fault.
     #[test]
     fn every_warning_is_routed_or_allowlisted() {
-        let all = include_str!("main.rs");
+        let src = include_str!("main.rs");
         // Exclude this test module: its own source quotes the very literals and
         // macro names being scanned for, and counting those would let the guard
         // satisfy itself.
-        let src = &all[..all.find("\n#[cfg(test)]\n").expect("test module marker")];
+        // Find the TOP-LEVEL test module, line-ending agnostically. Two traps here,
+        // and CI caught the second on Windows after local runs were all green:
+        //   * there is an INDENTED `#[cfg(test)]` earlier in this file, so a plain
+        //     `find` cuts in the wrong place and hides most of the corpus;
+        //   * matching "\n#[cfg(test)]\n" assumes LF. Git for Windows checks out
+        //     CRLF by default and this repo has no .gitattributes, so that marker
+        //     is absent there and the guard panicked instead of running.
+        // Requiring the match to be preceded by '\n' satisfies both: it holds
+        // under CRLF too, and an indented occurrence is preceded by a space.
+        let cut = src
+            .match_indices("#[cfg(test)]")
+            .find(|(i, _)| *i == 0 || src.as_bytes()[i - 1] == b'\n')
+            .map(|(i, _)| i)
+            .expect("top-level test module marker");
+        let src = &src[..cut];
 
         // ── What this guard DOES and DOES NOT cover ─────────────────────────
         // It covers THIS FILE and fully-qualified `tracing::` macros, and nothing
