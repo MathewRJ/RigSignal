@@ -481,6 +481,23 @@ SH
 # and it fires everywhere because a loop that does not space its samples
 # invalidates every scenario at once.
 #
+# COLUMN LABELS ARE ABBREVIATED; the real scenario strings are `counterreset`
+# (shown as reset) and `nonrestarts` (shown as norestarts). Spelled out because
+# `norestarts` differs from the real value by one letter, which reads as a name
+# rather than as an abbreviation and sends a reader looking for a scenario that
+# does not exist.
+#
+# ONE ROW THIS TABLE DOES NOT CARRY, recorded rather than silently dropped. A
+# retracted earlier version of this table had a `counter fail-closed when absent`
+# row, CATCHing on nonrestarts alone -- the property `expect_start nonrestarts`
+# names, that an absent NRestarts reading must DEGRADE and never fail closed.
+# There is no equivalent row here: this table's `any counter CHANGE is failure`
+# row targets the inner comparison, not the outer empty-check. The row is NOT
+# reinstated because it has not been re-measured on this revision, and a coverage
+# row asserted without measurement is the exact defect that made the earlier table
+# worth retracting. The scenario itself still runs and still enforces the
+# property; only its mutation evidence is missing.
+#
 # The full-revert row is deliberately not all CATCH: the old code succeeded for
 # a healthy unit, a reset counter, an absent counter and a slow start, and those
 # four cells SHOULD stay `.`. Only the three crash-loop scenarios distinguish the
