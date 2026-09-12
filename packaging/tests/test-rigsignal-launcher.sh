@@ -315,71 +315,6 @@ ebpf_sleeps() {
     fi
 }
 
-# ── Setup assertions: each stub's documented behaviour, EXECUTED ─────────────
-# Every sentence a scenario stub carries about itself is a claim about a FIXTURE,
-# and fixture behaviour is executable. Three wrong comments accumulated in this
-# file's history -- each written by a careful reader, each surviving review at the
-# time -- and every one was such a claim. The most expensive silently disarmed two
-# scenarios and let a two-sample streak ship GREEN.
-#
-# A comment cannot fail. These can.
-#
-# THEY READ WHAT THE RUN ACTUALLY OBSERVED, not what a predicate would answer in
-# isolation, and that distinction is the whole mechanism. The incident being
-# guarded against changed NO predicate -- it changed which ticks the predicates
-# were ever shown, by letting the agent wait advance a whole-run clock before
-# ebpf_start began. A probe that set the clock itself would have kept reporting
-# the documented pattern throughout, and would not have caught it.
-observed_pattern() {   # $1 = scenario -> echoes e.g. "0:A 1:. 2:."
-    run_ebpf_scenario "$1" >/dev/null 2>&1 || true
-    if [ -f "$ebpf_tmp/state/is-active-log" ]; then
-        tr '\n' ' ' < "$ebpf_tmp/state/is-active-log"
-    fi
-}
-
-# crashloop: "active at the instant of the fork, cycling thereafter".
-# twotick:   "active for exactly two consecutive samples, then gone".
-# Both name a SPECIFIC EARLY TICK, which is exactly what an unscoped clock takes
-# away: they would collapse into the inactive default and stop discriminating.
-_crash_p="$(observed_pattern crashloop)"
-case "$_crash_p" in
-    "0:A 1:. "*) ;;
-    *) echo "fixture premise broken -- crashloop must be active at tick 0 and inactive after; observed: $_crash_p" >&2
-       exit 1 ;;
-esac
-_two_p="$(observed_pattern twotick)"
-case "$_two_p" in
-    "0:A 1:A 2:. "*) ;;
-    *) echo "fixture premise broken -- twotick must be active for exactly ticks 0 and 1; observed: $_two_p" >&2
-       exit 1 ;;
-esac
-# healthy is the control for both: if it were not active throughout, "inactive"
-# above would be evidence of nothing.
-_healthy_p="$(observed_pattern healthy)"
-case "$_healthy_p" in
-    *:.*) echo "fixture premise broken -- healthy went inactive, so the inactive samples above prove nothing; observed: $_healthy_p" >&2
-          exit 1 ;;
-esac
-case "$_healthy_p" in
-    "0:A"*) ;;
-    *) echo "fixture premise broken -- healthy's first sample is not tick 0, so the eBPF clock is not scoped to its phase; observed: $_healthy_p" >&2
-       exit 1 ;;
-esac
-# flap: "never three in a row, but active half the time". Its predicate is
-# PERIODIC, so it survives any clock shift -- which is what let it keep catching a
-# single-sample streak while crashloop and twotick were disarmed. flap therefore
-# MASKS the absence of the others, and its own premise is pinned separately.
-_flap_p="$(observed_pattern flap)"
-case "$_flap_p" in
-    *"A"*) ;;
-    *) echo "fixture premise broken -- flap is never active, so it exercises no streak; observed: $_flap_p" >&2
-       exit 1 ;;
-esac
-case "$(printf '%s' "$_flap_p" | sed 's/[0-9]*://g; s/ //g')" in
-    *AAA*) echo "fixture premise broken -- flap reached three consecutive active samples; observed: $_flap_p" >&2
-           exit 1 ;;
-esac
-
 # Setup assertion: the agent half must succeed in every scenario, otherwise a
 # missing eBPF line would be explained by the launcher never reaching ebpf_start
 # rather than by the check under test.
@@ -411,6 +346,117 @@ case "$(sort -u "$ebpf_tmp/state/durations-ebpf")" in
     1) ;;
     *) echo "eBPF wait did not space its samples by one second" >&2; exit 1 ;;
 esac
+
+# Placed AFTER the eBPF sleep-count and spacing assertions, deliberately. Run
+# before them, these fire FIRST on a product regression and report it as a broken
+# FIXTURE -- measured: a launcher streak of `-ge 3` weakened to `-ge 1` was
+# announced as "crashloop premise broken" instead of "healthy took 0 sleeps".
+# Still red either way, but naming the wrong side of the fixture/product line
+# sends the reader to the wrong file.
+# ── Setup assertions: each stub's documented behaviour, EXECUTED ─────────────
+# Every sentence a scenario stub carries about itself is a claim about a FIXTURE,
+# and fixture behaviour is executable. Three wrong comments accumulated in this
+# file's history -- each written by a careful reader, each surviving review at the
+# time -- and every one was such a claim. The most expensive silently disarmed two
+# scenarios and let a two-sample streak ship GREEN.
+#
+# A comment cannot fail. These can.
+#
+# THEY READ WHAT THE RUN ACTUALLY OBSERVED, not what a predicate would answer in
+# isolation, and that distinction is the whole mechanism. The incident being
+# guarded against changed NO predicate -- it changed which ticks the predicates
+# were ever shown, by letting the agent wait advance a whole-run clock before
+# ebpf_start began. A probe that set the clock itself would have kept reporting
+# the documented pattern throughout, and would not have caught it.
+observed_pattern() {   # $1 = scenario -> echoes e.g. "0:A 1:. 2:."
+    run_ebpf_scenario "$1" >/dev/null 2>&1 || true
+    if [ -f "$ebpf_tmp/state/is-active-log" ]; then
+        tr '\n' ' ' < "$ebpf_tmp/state/is-active-log"
+    fi
+}
+
+# crashloop: "active at the instant of the fork, cycling thereafter".
+# twotick:   "active for exactly two consecutive samples, then gone".
+# Both name a SPECIFIC EARLY TICK, which is exactly what an unscoped clock takes
+# away: they would collapse into the inactive default and stop discriminating.
+# Collapse "0:A 1:. ..." to "A.." so the WHOLE shape is pinned, not a prefix.
+# A prefix check accepts a stub that satisfies its opening and then misbehaves:
+# measured by the reviewer, twotick active again on even ticks >= 4 passed the
+# prefix form while falsifying its own documented "then gone".
+verdicts() {          # $1 = scenario -> e.g. "A.."; empty means NOTHING was observed
+    _vraw="$(observed_pattern "$1")"
+    _vp="$(printf '%s' "$_vraw" | tr ' ' '\n' | sed -n 's/^[0-9][0-9]*://p' | tr -d '\n')"
+    # A failed pipeline yields empty, and an empty string matches no positive
+    # pattern below -- so this fails CLOSED. Asserted rather than assumed,
+    # because the negative checks alone would silently accept it.
+    [ -n "$_vp" ] || {
+        echo "fixture premise broken -- $1 produced no is-active samples at all (raw: '$_vraw')" >&2
+        exit 1
+    }
+    printf '%s' "$_vp"
+}
+
+_crash_p="$(observed_pattern crashloop)"
+_crash_v="$(verdicts crashloop)"
+case "$_crash_v" in
+    A) echo "fixture premise broken -- crashloop produced only one sample, so 'cycling thereafter' was never exercised: $_crash_p" >&2; exit 1 ;;
+esac
+case "$_crash_v" in
+    A.*) ;;
+    *) echo "fixture premise broken -- crashloop must be active at tick 0 and inactive after; observed: $_crash_p" >&2
+       exit 1 ;;
+esac
+# ... and ACTIVE EXACTLY ONCE. The prefix above admits a stub that goes active
+# again later, which is the documented premise broken in the direction that
+# quietly weakens the scenario.
+case "${_crash_v#A}" in
+    *A*) echo "fixture premise broken -- crashloop goes active again after tick 0; observed: $_crash_p" >&2
+         exit 1 ;;
+esac
+_two_p="$(observed_pattern twotick)"
+_two_v="$(verdicts twotick)"
+case "$_two_v" in
+    AA.*) ;;
+    *) echo "fixture premise broken -- twotick must be active for exactly ticks 0 and 1; observed: $_two_p" >&2
+       exit 1 ;;
+esac
+case "${_two_v#AA}" in
+    *A*) echo "fixture premise broken -- twotick goes active again after tick 1, falsifying 'then gone'; observed: $_two_p" >&2
+         exit 1 ;;
+esac
+# healthy is the control for both: if it were not active throughout, "inactive"
+# above would be evidence of nothing.
+_healthy_p="$(observed_pattern healthy)"
+case "$_healthy_p" in
+    *:.*) echo "fixture premise broken -- healthy went inactive, so the inactive samples above prove nothing; observed: $_healthy_p" >&2
+          exit 1 ;;
+esac
+case "$_healthy_p" in
+    "0:A"*) ;;
+    *) echo "fixture premise broken -- healthy's first sample is not tick 0, so the eBPF clock is not scoped to its phase; observed: $_healthy_p" >&2
+       exit 1 ;;
+esac
+# flap: "never three in a row, but active half the time". Its predicate is
+# PERIODIC, so it survives any clock shift -- which is what let it keep catching a
+# single-sample streak while crashloop and twotick were disarmed. flap therefore
+# MASKS the absence of the others, and its own premise is pinned separately.
+_flap_p="$(observed_pattern flap)"
+case "$_flap_p" in
+    *"A"*) ;;
+    *) echo "fixture premise broken -- flap is never active, so it exercises no streak; observed: $_flap_p" >&2
+       exit 1 ;;
+esac
+# NEVER TWO consecutive, not merely never three. The file's own prose says
+# "crashloop and flap never reach two either" -- that sentence is what makes
+# twotick the unique discriminator between a two- and three-sample streak, so it
+# is the premise that has to hold. Measured by the reviewer: flap changed to
+# `t % 4 -lt 2` reaches two consecutive and passed the three-only check.
+_flap_v="$(verdicts flap)"
+case "$_flap_v" in
+    *AA*) echo "fixture premise broken -- flap reached two consecutive active samples, so twotick is no longer the only scenario separating a two-sample streak from a three-sample one; observed: $_flap_p" >&2
+          exit 1 ;;
+esac
+
 
 # A daemon that is active only at the instant of the fork must NOT be reported as
 # started. The absence assertion gets its own case: shell takes the first matching
