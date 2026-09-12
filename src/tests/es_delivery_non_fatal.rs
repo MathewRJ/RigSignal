@@ -155,9 +155,14 @@ fn unreachable_elasticsearch_does_not_abort_the_agent() {
     );
 }
 
-/// The marked line is echoed to `rigsignal status` stdout, so it must not carry
-/// the error -- the context on this path interpolates the configured endpoint,
-/// and an endpoint can carry a credential in a query parameter.
+/// The endpoint credential must not reach stderr AT ALL, and separately the
+/// marked line -- echoed to `rigsignal status` stdout -- must not carry the error.
+///
+/// The whole-log assertion below is the one that covers the actual boundary. The
+/// compile-time guard over `tracing::` call sites is line-based and only sees a
+/// call that STARTS a line, so the same leak reintroduced in the multi-line form
+/// rustfmt produces passes every unit test. This test holds the real stderr, so
+/// it catches that; the guard's own blind spot is tracked separately.
 #[test]
 fn the_marked_preflight_line_does_not_carry_the_endpoint() {
     let tmp = std::env::temp_dir().join(format!(
@@ -224,6 +229,14 @@ fn the_marked_preflight_line_does_not_carry_the_endpoint() {
              marked lines to stdout: {line}"
         );
     }
+    // THE BOUNDARY: the credential must appear nowhere in the process's stderr,
+    // marked or unmarked. Checking only marked lines tests one layer inside the
+    // property actually wanted, and passes for a leak on any other line.
+    assert!(
+        !log_text.contains(canary),
+        "the endpoint credential reached stderr somewhere outside the marked \
+         lines.\nstderr:\n{log_text}"
+    );
     // And the detail must still reach the journal on an UNMARKED line, or the
     // redaction has cost the operator the diagnosis.
     assert!(
