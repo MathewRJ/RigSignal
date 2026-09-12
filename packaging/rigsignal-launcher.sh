@@ -435,15 +435,81 @@ wait_agent_active() {
     return 1
 }
 
+# Wait for the eBPF system unit to be STAYING active, rather than to have been
+# active at one instant.
+#
+# `systemctl start` returns as soon as a Type=simple unit has forked, and systemd
+# marks it active at that moment even when the process is about to die. A single
+# is-active sample taken straight afterwards therefore asks "did this unit exist a
+# moment ago", which is true of a unit that is failing. Measured on systemd 259
+# against this unit's own parameters (Type=simple, Restart=on-failure,
+# RestartSec=5): 80/80 false success across failure speeds of 0 s, 50 ms, 0.5 s
+# and 3 s. A healthy control reported success 20/20 and a control inserting a
+# 0.5 s gap caught 20/20, so the measurement is not a dead instrument. The catch
+# boundary sat between 2 ms and 10 ms: anything slower was invisible.
+#
+# Returns 0 staying active · 1 did not stay active · 2 the unit was SKIPPED.
+#
+# Deliberately self-contained, sharing no helper with the agent-side wait, so the
+# two can be changed independently.
+wait_ebpf_active() {
+    # A unit whose ConditionPathExists is unmet is SKIPPED, not failed: `start`
+    # returns 0 and the unit simply stays inactive (measured: is-active exits 4,
+    # ActiveState=inactive, ConditionResult=no). Polling twelve seconds for that
+    # would add twelve seconds to every `rigsignal start` on a machine without
+    # the eBPF binary, which is the ordinary case — so detect it once, up front.
+    if [ "$(sudo -n systemctl show -p ConditionResult --value "$EBPF_UNIT" 2>/dev/null)" = "no" ]; then
+        return 2
+    fi
+    _wea_streak=0
+    _wea_i=0
+    while [ "$_wea_i" -lt 12 ]; do
+        # `sudo -n` only. The caller has already run a privileged command, so the
+        # credential is cached; a sample that cannot run counts as NOT active and
+        # resets the streak. That fails CLOSED, which is the safe direction here:
+        # at the configuration-sync call site a wrong "healthy" commits a config
+        # the daemon is crash-looping on, while a wrong "unhealthy" only rolls
+        # back to the previous working one.
+        if sudo -n systemctl is-active --quiet "$EBPF_UNIT" >/dev/null 2>&1; then
+            _wea_streak=$((_wea_streak + 1))
+            if [ "$_wea_streak" -ge 3 ]; then
+                return 0
+            fi
+        else
+            _wea_streak=0
+        fi
+        sleep 1
+        _wea_i=$((_wea_i + 1))
+    done
+    return 1
+}
+
 # Attempt to start/stop the eBPF system service via sudo.
 # Non-fatal: eBPF is optional — agent-only mode still ships all metric streams.
 ebpf_start() {
-    if sudo -n systemctl start "$EBPF_UNIT" >/dev/null 2>&1; then
-        _ok "eBPF daemon started ($EBPF_UNIT)"
-        return 0
-    elif sudo systemctl start "$EBPF_UNIT" >/dev/null 2>&1; then
-        _ok "eBPF daemon started ($EBPF_UNIT)"
-        return 0
+    if sudo -n systemctl start "$EBPF_UNIT" >/dev/null 2>&1 \
+        || sudo systemctl start "$EBPF_UNIT" >/dev/null 2>&1; then
+        # `systemctl start` returning 0 means the unit FORKED, not that it runs.
+        # Reporting success on that alone made this line true of a daemon that
+        # died immediately — with no sample taken at all, it was a weaker check
+        # than the single-sample one at the configuration-sync site.
+        wait_ebpf_active
+        case $? in
+            0)
+                _ok "eBPF daemon started ($EBPF_UNIT)"
+                return 0
+                ;;
+            2)
+                _warn "eBPF daemon not started: $EBPF_UNIT was skipped because its binary is absent."
+                _info "Scheduler and kernel metrics will be absent. Agent-only mode active."
+                return 1
+                ;;
+            *)
+                _warn "eBPF daemon started but did not stay active ($EBPF_UNIT)."
+                _info "Scheduler and kernel metrics will be absent. Check: sudo systemctl status $EBPF_UNIT"
+                return 1
+                ;;
+        esac
     else
         _warn "eBPF daemon not started (no sudo/polkit or CAP_BPF unavailable)."
         _info "Scheduler and kernel metrics will be absent. Agent-only mode active."
@@ -1456,7 +1522,24 @@ PYEOF
         fi
     fi
     if [ "$_sync_ok" = "1" ] && [ "$_ebpf_was_active" = "1" ]; then
-        sudo systemctl start "$EBPF_UNIT" && sudo systemctl is-active --quiet "$EBPF_UNIT" || _sync_ok=0
+        # The single is-active sample this replaces reported success 80/80 against
+        # a unit that was dying, because it sampled at fork. The daemon is being
+        # restarted onto a configuration that was just rewritten, so the failure
+        # this has to catch is precisely a daemon that starts and then dies on the
+        # new config -- and committing the transaction in that case leaves the
+        # broken config in place with the rollback that exists for it unused.
+        #
+        # A SKIPPED unit (rc 2) is not a sync failure: it means the binary is
+        # absent, which is unrelated to the configuration just written, and
+        # rolling back for it would be wrong.
+        sudo systemctl start "$EBPF_UNIT" || _sync_ok=0
+        if [ "$_sync_ok" = "1" ]; then
+            wait_ebpf_active
+            _sync_ebpf_rc=$?
+            if [ "$_sync_ebpf_rc" = "1" ]; then
+                _sync_ok=0
+            fi
+        fi
     fi
     # Restore root scope while SteamOS is still writable.  If this fails, leave
     # the caller's matching user transaction intact rather than making it mixed.
