@@ -542,6 +542,18 @@ assets_interrupted() {
     # interrupts wait without reaping the child; that first status is not the
     # engine status. Disable reentry before forwarding or waiting again.
     trap '' HUP INT TERM
+    # The engine's lifetime begins at fork, not at the assignment on the next
+    # line.  A signal delivered between `engine &` and `ASSETS_ENGINE_PID=$!`
+    # finds the registration variable still empty, so every branch below would
+    # take its no-engine path and cleanup would delete the one-shot credential
+    # while a live engine still expects it.  $! is already the engine's pid in
+    # that window, so resolve from it.  ASSETS_ENGINE_SPAWNED is what makes
+    # that safe: $! keeps naming the engine after it has been reaped, and pid
+    # numbers are recycled, so an ungated fallback could signal an unrelated
+    # process.  Resolve before the watchdog below, which reassigns $!.
+    if [ -z "${ASSETS_ENGINE_PID:-}" ] && [ "${ASSETS_ENGINE_SPAWNED:-0}" = "1" ]; then
+        ASSETS_ENGINE_PID=$!
+    fi
     # Preserve a completed ordinary wait before starting any background job:
     # dash can discard its cached status when the watchdog is spawned.
     if [ -n "${ASSETS_ENGINE_PID:-}" ] && ! kill -0 "$ASSETS_ENGINE_PID" 2>/dev/null; then
@@ -581,8 +593,17 @@ PYEOF
     else
         [ -n "${ASSETS_ENGINE_STATUS+x}" ] || ASSETS_ENGINE_STATUS=$_assets_signal_status
     fi
-    assets_cleanup "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
-    trap - EXIT HUP INT TERM
+    # Retire the EXIT trap BEFORE teardown, and handle cleanup's return
+    # deliberately.  assets_cleanup returns the status it was given and resets
+    # ASSETS_CLEANING on the way out, so with errexit enabled above a nonzero
+    # engine status ended the shell on this very line -- before the trap was
+    # removed -- and the still-installed EXIT trap ran cleanup a second time.
+    # HUP/INT/TERM stay ignored (set at the top of this handler) across the
+    # teardown, so a second signal during cleanup still cannot strand the
+    # one-shot credential; they are retired only once teardown is complete.
+    trap - EXIT
+    assets_cleanup "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}" || true
+    trap - HUP INT TERM
     exit "${ASSETS_ENGINE_STATUS:-$_assets_signal_status}"
 }
 
@@ -935,7 +956,7 @@ PY
     resolve_assets_installation || _assets_die "assets install: matching engine installation is unavailable"
     ASSETS_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rigsignal-assets.XXXXXX") || _assets_die "assets install: could not create private temporary directory"
     chmod 700 "$ASSETS_TMP" || _assets_die "assets install: could not secure temporary directory"
-    ASSETS_ENGINE_PID=""
+    ASSETS_ENGINE_PID="" ASSETS_ENGINE_SPAWNED=0
     trap assets_cleanup EXIT
     trap 'assets_interrupted HUP' HUP
     trap 'assets_interrupted INT' INT
@@ -999,6 +1020,11 @@ PY
     # On a signal the cancellation handler owns reaping and exits; this
     # ordinary wait path is only resumed when no cancellation was handled.
     set +e
+    # Declare the spawn before the fork and retire it only once the engine has
+    # been reaped: this flag is what licenses the handler to resolve the pid
+    # from $! during the spawn/registration window, and what stops it doing so
+    # once $! names a reaped pid whose number may have been recycled.
+    ASSETS_ENGINE_SPAWNED=1
     python3 "$ASSETS_ENGINE/install_assets.py" --assets-only --profile user --ownership-profile default \
         --bundle "$ASSETS_BUNDLE_SNAPSHOT" --endpoint "$ASSETS_ENDPOINT" --ca-file "$CA_SNAPSHOT" \
         --kibana-endpoint "$ASSETS_KIBANA" --kibana-ca-file "$CA_SNAPSHOT" \
@@ -1006,6 +1032,7 @@ PY
     ASSETS_ENGINE_PID=$!
     wait "$ASSETS_ENGINE_PID"
     ASSETS_ENGINE_STATUS=$?
+    ASSETS_ENGINE_SPAWNED=0
     ASSETS_ENGINE_PID=""
     set -e
     return "$ASSETS_ENGINE_STATUS"
