@@ -1996,98 +1996,142 @@ mod tests {
         // satisfy itself.
         let src = &all[..all.find("\n#[cfg(test)]\n").expect("test module marker")];
 
-        // ── Precondition: the RECOGNISER must be complete ────────────────────
-        // Everything below finds call sites by the text `tracing::warn!` /
-        // `tracing::error!`. If the macros are ever imported unqualified, a bare
-        // `warn!(..)` becomes invisible and this guard silently stops covering
-        // it while still passing. That is the failure mode an incomplete
-        // recogniser always has, so it is asserted rather than assumed.
-        for bad in ["use tracing::warn", "use tracing::error", "use tracing::{"] {
+        // ── What this guard DOES and DOES NOT cover ─────────────────────────
+        // It covers THIS FILE and fully-qualified `tracing::` macros, and nothing
+        // else. Other modules log too -- session.rs and the collectors among them
+        // -- and are NOT examined here; `remote_connections.rs` even imports the
+        // macros unqualified already. Stating the boundary because the previous
+        // revision's "every site" was read as tree-wide when it never was.
+        for bad in [
+            "use tracing::warn",
+            "use tracing::error",
+            "use tracing::{",
+            "use tracing::*",
+            "use tracing as ",
+            "#[macro_use]",
+        ] {
             assert!(
                 !src.contains(bad),
-                "`{bad}` makes unqualified `warn!`/`error!` possible, which this \
-                 guard cannot see. Either keep the macros fully qualified or teach \
-                 the scan the unqualified form BEFORE landing that import."
+                "`{bad}` in main.rs makes an unqualified `warn!`/`error!` possible, \
+                 which this guard cannot see. Teach the scan that form BEFORE \
+                 landing the import."
             );
         }
 
         // ── Enumerate EVERY call site, wherever it sits on its line ──────────
-        // The previous revision keyed leg 2 on `line.starts_with(..)`, so any
-        // call that did not begin its line was unguarded -- measured: 2 of 23
-        // real sites, and a leak reintroduced in the multi-line form rustfmt
-        // produces passed the whole unit suite. Position is not a property of
-        // the code, only of its formatting.
+        // The previous revision keyed on `line.starts_with(..)`, so any call not
+        // beginning its line was unguarded -- measured: 2 of 23 real sites, and a
+        // leak in the multi-line form rustfmt produces passed the whole suite.
         let sites = warning_call_sites(src);
-        assert!(
-            sites.len() >= 20,
-            "found only {} warning sites; the scan is broken and every check \
-             below would pass vacuously",
-            sites.len()
-        );
 
-        // ── Each site must be accounted for, by ROUTING or by ALLOWLIST ──────
+        // A NAIVE count cannot fail the way a balanced scan can, so disagreement
+        // between them means the scan dropped a site. This replaces a magic
+        // minimum, which left silent headroom: a dropped site kept the total
+        // inside the floor and the loops below simply never saw it.
+        let raw = src.matches("tracing::warn!").count() + src.matches("tracing::error!").count();
+        assert_eq!(
+            sites.len(),
+            raw,
+            "the call scanner delimited {} of {} occurrences; a site it cannot \
+             delimit must never be silently skipped",
+            sites.len(),
+            raw
+        );
+        for (line_no, body) in &sites {
+            assert_ne!(
+                body, "<UNPARSEABLE>",
+                "line {line_no}: the scanner could not delimit this call, so it \
+                 was not checked. Fix the scanner rather than the call."
+            );
+        }
+
+        // ── Each site must be accounted for, by ROUTING or by an exact entry ─
         // Inverted from the previous revision, which enumerated seven GOOD sites
-        // and therefore could not see an eighth. This enumerates the sites and
-        // demands each be classified, so a NEW warning fails until someone says
-        // which it is. Allowlisted entries are those that render no error value.
+        // and could not see an eighth. Entries are matched with `starts_with` on
+        // the NORMALISED CALL BODY, not `contains` on a fragment: a generic
+        // fragment like "docs failed" auto-exempts any future message containing
+        // those words, which is an auto-accept surface rather than an allowlist.
         const RENDERS_NO_ERROR: [&str; 7] = [
-            "Elasticsearch delivery failing since",
-            "Elasticsearch delivery recovered after",
-            "startup preflight failed",
-            "User-specified target not found",
-            "remote_connections tailer disabled: direct Elasticsearch endpoint",
-            "remote_connections bulk batch retained for replay",
-            "docs failed",
+            "\"{} Elasticsearch delivery failing since {}",
+            "\"{} Elasticsearch delivery recovered after {}",
+            "\"{} startup preflight failed",
+            "\"User-specified target not found",
+            "\"remote_connections tailer disabled: direct",
+            "failed = result.failed, \"remote_connections bulk batch retained",
+            "\"Tick {}: {}/{} docs failed\"",
         ];
-        // Sites that DO render an error but deliberately not through the safe
-        // renderer, each because its outermost context is a static literal --
-        // which is exactly the precondition `error_for_log` documents and relies
-        // on. Adding a site here is a claim about the error's OUTERMOST layer,
-        // not about the call.
-        const STATIC_OUTERMOST_CONTEXT: [&str; 7] = [
-            "Elasticsearch startup preflight error",
-            "remote_connections tailer disabled during startup",
-            "transform schedule_now failed (non-fatal)",
-            "remote_connections checkpoint acknowledgement failed",
-            "remote_connections bulk transport error",
-            "remote_connections tail error",
-            "Tick {} bulk error",
+        // These DO render an error and are deliberately not routed through the
+        // safe renderer.
+        //
+        // THIS IS A WAIVER LIST, NOT A PROOF, and the name says so because the
+        // previous revision called it STATIC_OUTERMOST_CONTEXT and asserted that
+        // every entry's outermost layer was a static literal. A non-author review
+        // falsified that for ALL SEVEN entries: `shipper::ping`, `ship_documents`
+        // and `trigger_transform_sync` each call `build_client(config)?` with a
+        // bare `?`, so a CA-cert read failure makes
+        // `format!("reading Elasticsearch CA cert: {}", path.display())` the
+        // outermost layer; the remote_connections entries resolve into
+        // path-interpolating contexts the same way.
+        //
+        // Nothing here checks a row. A row that claims more than it can show turns
+        // a live leak into a documented exemption, which is worse than no row --
+        // so the claim is now only that a human looked and waived it, and the
+        // outermost-context question is tracked as its own commitment.
+        const WAIVED_RENDERS_AN_ERROR: [&str; 8] = [
+            "\"Elasticsearch startup preflight error: {}\", e",
+            "%error, \"remote_connections tailer disabled during startup\"",
+            "\"transform schedule_now failed (non-fatal): {}\", e",
+            "%error, \"remote_connections checkpoint acknowledgement failed\"",
+            "%error, \"remote_connections bulk transport error",
+            "%error, \"remote_connections tail error\"",
+            "\"{} error: {}\", dataset, e",
+            "\"Tick {} bulk error: {}\", tick_num, e",
         ];
 
         let mut unclassified = Vec::new();
         for (line_no, body) in &sites {
             let routed = body.contains("error_for_log(");
-            let known = RENDERS_NO_ERROR
+            let listed = RENDERS_NO_ERROR
                 .iter()
-                .chain(STATIC_OUTERMOST_CONTEXT.iter());
-            let listed = known.clone().any(|m| body.contains(m)) || body.contains("{} error: {}");
+                .chain(WAIVED_RENDERS_AN_ERROR.iter())
+                .any(|m| body.starts_with(m));
             if !routed && !listed {
                 unclassified.push(format!("line {line_no}: {body}"));
             }
         }
         assert!(
             unclassified.is_empty(),
-            "warning site(s) render an error through neither the safe renderer \
-             nor a declared exemption. Route through `error_for_log`, or add the \
-             message to one of the tables above WITH the reason it is safe:\n{}",
+            "warning site(s) render through neither the safe renderer nor a \
+             declared entry. Route through `error_for_log`, or add the call's \
+             exact leading text to one of the tables above WITH its reason:\n{}",
             unclassified.join("\n")
         );
 
-        // ── No alternate formatting, at ANY position ─────────────────────────
-        // `{:#}` on an anyhow error prints every cause verbatim. That is the
-        // design this replaced, after it was shown to put an Elasticsearch URL
-        // and its credential, a spool path, and a forged second line on stderr.
+        // ── No alternate error formatting, at ANY position ───────────────────
+        // `{:#}` prints every cause verbatim. So does `{:?}`, which ALSO spans
+        // lines -- it is simultaneously the credential leak and the forged
+        // second line that `error_for_log_never_emits_a_forged_second_line`
+        // exists to prevent. The previous revision blocked only `{:#}`, while the
+        // comment at the preflight site named `{:?}` as equally harmful; a guard
+        // must not be narrower than the hazard its own neighbours describe.
+        // `{:#?}` contains neither of the other two as a substring, so all three
+        // are listed.
         for (line_no, body) in &sites {
-            assert!(
-                !body.contains("{:#}"),
-                "line {line_no} uses alternate error formatting, which prints \
-                 every cause verbatim: {body}"
-            );
+            for spec in ["{:#}", "{:?}", "{:#?}"] {
+                assert!(
+                    !body.contains(spec),
+                    "line {line_no} uses `{spec}`, which prints every cause \
+                     verbatim: {body}"
+                );
+            }
         }
 
         // ── The seven spool warnings specifically must stay routed ───────────
-        // Kept from the previous revision: these are the sites whose errors carry
-        // an errno that must reach the log, so routing is required, not optional.
+        // The message is pinned together with its format spec, `{message}{}"`,
+        // restoring a property the previous rewrite dropped: matching the message
+        // alone let a spool site keep the renderer AND gain a second, raw
+        // argument, and let its own spec change from `{}` to something else.
+        // Measured: three mutants the older guard caught passed the rewrite.
         const SPOOL_WARNINGS: [&str; 7] = [
             "Failed to ship session-start doc: ",
             "Failed to ship game-detected doc: ",
@@ -2098,10 +2142,15 @@ mod tests {
             "Failed to finalize spool files during shutdown: ",
         ];
         for message in SPOOL_WARNINGS {
+            let pinned = format!("{message}{{}}\"");
             let site = sites
                 .iter()
-                .find(|(_, body)| body.contains(message))
-                .unwrap_or_else(|| panic!("warning message no longer present: {message}"));
+                .find(|(_, body)| body.contains(&pinned))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "spool warning missing, or its format spec is no longer `{{}}`: {message}"
+                    )
+                });
             assert!(
                 site.1.contains("error_for_log(&e)"),
                 "`{message}` does not render through the safe renderer: {}",
@@ -2110,13 +2159,18 @@ mod tests {
         }
     }
 
-    /// Every `tracing::warn!`/`error!` call in `src`, as `(line number, argument text)`.
+    /// Every `tracing::warn!`/`error!` call in `src`, as `(line number, body)`.
     ///
-    /// Finds calls by position-independent search and delimits each by a
-    /// STRING-AWARE balanced-paren scan. Both properties are load-bearing:
-    /// a line-anchored search misses a wrapped call, and a naive paren count
-    /// terminates early on a message that contains a parenthesis -- which one of
-    /// these messages, "transform schedule_now failed (non-fatal)", actually does.
+    /// Position-independent, so a call that does not begin its line is still
+    /// found, and string-aware, because one message contains a parenthesis
+    /// (`"transform schedule_now failed (non-fatal)"`) that terminates a naive
+    /// paren count early.
+    ///
+    /// A call it cannot delimit yields the body `<UNPARSEABLE>` rather than being
+    /// skipped. That distinction is the whole safety property: a silent skip is
+    /// fail-OPEN, and a `'('` char literal was measured doing exactly that --
+    /// inflating the depth, running to EOF, and dropping the site while the total
+    /// stayed inside a minimum-count floor.
     fn warning_call_sites(src: &str) -> Vec<(usize, String)> {
         let bytes = src.as_bytes();
         let mut out = Vec::new();
@@ -2125,15 +2179,18 @@ mod tests {
             while let Some(rel) = src[from..].find(pat) {
                 let at = from + rel;
                 from = at + pat.len();
+                let line_no = src[..at].matches('\n').count() + 1;
                 let Some(open) = src[at..].find('(').map(|o| at + o) else {
+                    out.push((line_no, "<UNPARSEABLE>".to_string()));
                     continue;
                 };
                 let mut depth = 0usize;
                 let mut in_str = false;
                 let mut escaped = false;
                 let mut end = None;
-                for (k, &byte) in bytes.iter().enumerate().skip(open) {
-                    let c = byte as char;
+                let mut k = open;
+                while k < bytes.len() {
+                    let c = bytes[k] as char;
                     if in_str {
                         if escaped {
                             escaped = false;
@@ -2142,6 +2199,15 @@ mod tests {
                         } else if c == '"' {
                             in_str = false;
                         }
+                        k += 1;
+                        continue;
+                    }
+                    // A char literal of the form 'X' -- skip it whole, so `'('`
+                    // cannot inflate the depth. Deliberately narrow: it matches
+                    // only the three-byte form, so a lifetime (`&'a T`) is left
+                    // alone rather than mis-consumed.
+                    if c == '\'' && k + 2 < bytes.len() && bytes[k + 2] == b'\'' {
+                        k += 3;
                         continue;
                     }
                     match c {
@@ -2156,14 +2222,18 @@ mod tests {
                         }
                         _ => {}
                     }
+                    k += 1;
                 }
-                let Some(end) = end else { continue };
-                let line_no = src[..at].matches('\n').count() + 1;
-                let body: String = src[open + 1..end]
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                out.push((line_no, body));
+                match end {
+                    Some(end) => {
+                        let body: String = src[open + 1..end]
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        out.push((line_no, body));
+                    }
+                    None => out.push((line_no, "<UNPARSEABLE>".to_string())),
+                }
             }
         }
         out
