@@ -164,4 +164,222 @@ case "$bad_key_output" in
 esac
 [ ! -e "$bad_key_home/.config/rigsignal/rigsignal.toml" ] || { echo "malformed API key was persisted" >&2; exit 1; }
 
+# ── eBPF start must not report success for a daemon that is not staying up ────
+#
+# `systemctl start` returns as soon as a Type=simple unit has FORKED. The shipped
+# ebpf_start reported "[OK] eBPF daemon started" on that alone, taking no sample
+# at all; the configuration-sync site took exactly one, immediately, which
+# measured 80/80 false success against a unit that was dying.
+#
+# The shims below model a CLOCK, like the agent-side scenarios: the sleep shim
+# advances it and returns at once, and every is-active answer is a function of it.
+# A wait loop that stopped spacing its samples would otherwise read one instant
+# three times and call a crash loop healthy, and a fixture keyed on call count
+# could not tell the difference.
+
+ebpf_tmp="$test_tmp/ebpf"
+mkdir -p "$ebpf_tmp/bin" "$ebpf_tmp/state"
+
+cat > "$ebpf_tmp/bin/sleep" <<'SH'
+#!/bin/sh
+# Record the REQUESTED duration, not merely that a call happened: a loop that
+# changed `sleep 1` to `sleep 0` would still satisfy a call-count assertion while
+# sampling a single instant repeatedly.
+printf '%s\n' "${1-}" >> "$RS_TEST_STATE/durations"
+t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
+echo $((t + 1)) > "$RS_TEST_STATE/clock"
+exit 0
+SH
+chmod +x "$ebpf_tmp/bin/sleep"
+
+cat > "$ebpf_tmp/bin/sudo" <<'SH'
+#!/bin/sh
+# Drop sudo's own options and run the rest through the shim PATH, so the
+# systemctl shim answers. Records whether -n was used, because the wait samples
+# must be non-interactive.
+[ "${1-}" = "-n" ] && printf 'n\n' >> "$RS_TEST_STATE/sudo-n"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*) shift ;;
+        *)  break ;;
+    esac
+done
+exec "$@"
+SH
+chmod +x "$ebpf_tmp/bin/sudo"
+
+cat > "$ebpf_tmp/bin/systemctl" <<'SH'
+#!/bin/sh
+scope=system
+[ "${1-}" = "--user" ] && { scope=user; shift; }
+verb="${1-}"; shift
+t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
+case "$scope:$verb" in
+    user:start)     exit 0 ;;
+    user:is-active) exit 0 ;;   # the agent is healthy in every scenario here
+    system:show)
+        # `systemctl show -p ConditionResult --value UNIT`
+        case "$RS_EBPF_SCENARIO" in
+            skipped) printf 'no\n' ;;
+            *)       printf 'yes\n' ;;
+        esac
+        exit 0 ;;
+    system:start)
+        case "$RS_EBPF_SCENARIO" in
+            nostart) exit 1 ;;
+            *)       exit 0 ;;
+        esac ;;
+    system:is-active)
+        case "$RS_EBPF_SCENARIO" in
+            healthy)   exit 0 ;;
+            # Active at the instant of the fork, cycling thereafter: exactly the
+            # shape a single immediate sample cannot distinguish from healthy.
+            crashloop) [ "$t" -eq 0 ] && exit 0; exit 3 ;;
+            # Never three in a row, but active half the time: a two-sample streak
+            # would accept this.
+            flap)      [ $((t % 2)) -eq 0 ] && exit 0; exit 3 ;;
+            # Active for exactly two consecutive samples, then gone. This is the
+            # ONLY scenario that separates a three-sample streak from a
+            # two-sample one: crashloop and flap never reach two either, so
+            # neither can tell those thresholds apart.
+            twotick)   [ "$t" -lt 2 ] && exit 0; exit 3 ;;
+            *)         exit 3 ;;
+        esac ;;
+esac
+exit 0
+SH
+chmod +x "$ebpf_tmp/bin/systemctl"
+
+run_ebpf_scenario() {
+    rm -rf "$ebpf_tmp/state"
+    mkdir -p "$ebpf_tmp/state"
+    RS_TEST_STATE="$ebpf_tmp/state" RS_EBPF_SCENARIO="$1" \
+        PATH="$ebpf_tmp/bin:/usr/bin:/bin" "$launcher" start 2>&1
+}
+
+ebpf_sleeps() {
+    # `wc -l < missing` is a REDIRECT failure reported by the shell, which
+    # 2>/dev/null on wc does not suppress; test for the file instead.
+    if [ -f "$ebpf_tmp/state/durations" ]; then
+        wc -l < "$ebpf_tmp/state/durations"
+    else
+        echo 0
+    fi
+}
+
+# Setup assertion: the agent half must succeed in every scenario, otherwise a
+# missing eBPF line would be explained by the launcher never reaching ebpf_start
+# rather than by the check under test.
+healthy_out="$(run_ebpf_scenario healthy)"
+case "$healthy_out" in
+    *"Agent started"*) ;;
+    *) echo "setup: cmd_start never reached ebpf_start" >&2; exit 1 ;;
+esac
+case "$healthy_out" in
+    *"eBPF daemon started"*) ;;
+    *) echo "healthy eBPF daemon was not reported as started" >&2; exit 1 ;;
+esac
+# Three consecutive samples means exactly two sleeps between them. wait_agent_active
+# contributes none here because its first sample succeeds.
+[ "$(ebpf_sleeps)" -eq 2 ] || {
+    echo "healthy scenario took $(ebpf_sleeps) sleeps, expected 2 (three consecutive samples)" >&2
+    exit 1
+}
+# Every sample must be non-interactive; a wait that prompts would hang a start.
+[ -s "$ebpf_tmp/state/sudo-n" ] || { echo "eBPF wait sampled without sudo -n" >&2; exit 1; }
+# And the samples must be a second apart, not zero.
+case "$(sort -u "$ebpf_tmp/state/durations")" in
+    1) ;;
+    *) echo "eBPF wait did not space its samples by one second" >&2; exit 1 ;;
+esac
+
+# A daemon that is active only at the instant of the fork must NOT be reported as
+# started. The absence assertion gets its own case: shell takes the first matching
+# arm, so testing presence and absence in one case would let output carrying both
+# the warning and the forbidden success line pass.
+crash_out="$(run_ebpf_scenario crashloop)"
+case "$crash_out" in
+    *"eBPF daemon started ("*)
+        echo "crash-looping eBPF daemon was reported as started" >&2; exit 1 ;;
+esac
+case "$crash_out" in
+    *"did not stay active"*) ;;
+    *) echo "crash-looping eBPF daemon produced no warning" >&2; exit 1 ;;
+esac
+
+# Active half the time but never three samples running is still a failure.
+flap_out="$(run_ebpf_scenario flap)"
+case "$flap_out" in
+    *"eBPF daemon started ("*)
+        echo "flapping eBPF daemon was reported as started" >&2; exit 1 ;;
+esac
+
+# Two consecutive samples are not enough. Without this scenario the streak
+# threshold could be lowered to two and nothing above would notice.
+twotick_out="$(run_ebpf_scenario twotick)"
+case "$twotick_out" in
+    *"eBPF daemon started ("*)
+        echo "eBPF daemon active for only two samples was reported as started" >&2; exit 1 ;;
+esac
+
+# A unit skipped by its own ConditionPathExists is not a failure to report as one,
+# and it must be detected WITHOUT paying the full poll: this is the ordinary case
+# on a machine with no eBPF binary, and twelve seconds would be added to every
+# `rigsignal start`.
+skip_out="$(run_ebpf_scenario skipped)"
+case "$skip_out" in
+    *"eBPF daemon started ("*)
+        echo "skipped eBPF unit was reported as started" >&2; exit 1 ;;
+esac
+case "$skip_out" in
+    *"binary is absent"*) ;;
+    *) echo "skipped eBPF unit was not reported as skipped" >&2; exit 1 ;;
+esac
+[ "$(ebpf_sleeps)" -eq 0 ] || {
+    echo "skipped eBPF unit polled $(ebpf_sleeps) times instead of returning at once" >&2
+    exit 1
+}
+
+# An unstartable unit keeps its existing message.
+nostart_out="$(run_ebpf_scenario nostart)"
+case "$nostart_out" in
+    *"eBPF daemon started ("*)
+        echo "unstartable eBPF unit was reported as started" >&2; exit 1 ;;
+esac
+case "$nostart_out" in
+    *"no sudo/polkit"*) ;;
+    *) echo "unstartable eBPF unit lost its diagnostic" >&2; exit 1 ;;
+esac
+
+# The configuration-sync site cannot be reached by the scenarios above: it sits
+# inside synchronize_ebpf_system_config, behind privilege elevation, a read-only
+# filesystem toggle and a CA rewrite. It is pinned by reading the source instead,
+# which is WEAKER and is labelled as such -- it proves the call shape, not the
+# behaviour. Without it the single-sample check could be restored there and every
+# scenario above would stay green, because none of them execute that line.
+launcher_src="$(cat "$launcher")"
+case "$launcher_src" in
+    *'systemctl start "$EBPF_UNIT" && '*'is-active'*)
+        echo "the eBPF sync site still pairs start with one immediate is-active" >&2
+        exit 1 ;;
+esac
+sync_region="$(sed -n '/^synchronize_ebpf_system_config()/,/^}/p' "$launcher")"
+case "$sync_region" in
+    *"wait_ebpf_active"*) ;;
+    *) echo "the eBPF sync site does not use wait_ebpf_active" >&2; exit 1 ;;
+esac
+# A skipped unit must not roll the configuration transaction back: an absent
+# binary says nothing about the configuration just written.
+# Match the variable and its comparison ADJACENTLY. An earlier version of this
+# guard allowed anything between them, and the function has more than twenty
+# later `= "1"` tests on unrelated variables -- so it matched one of those and
+# passed against a mutation of the very comparison it pins. A glob with a gap in
+# it asserts far less than it appears to.
+case "$sync_region" in
+    *'"$_sync_ebpf_rc" = "1"'*) ;;
+    *) echo "the eBPF sync site does not separate 'did not stay active' from 'skipped'" >&2; exit 1 ;;
+esac
+
+echo "rigsignal eBPF active-check guard: PASS"
+
 echo "rigsignal launcher handshake status guard: PASS"
