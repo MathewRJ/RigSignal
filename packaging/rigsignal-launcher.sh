@@ -1696,6 +1696,15 @@ cmd_setup() {
 # ── Subcommand: start ──────────────────────────────────────────────────────────
 
 cmd_start() {
+    # Clearing a failed state is new here, and it is the other half of widening
+    # the start limiter window.  Before that change the limiter could never trip,
+    # so the unit could not reach `failed` by crash-looping and this path was
+    # unreachable; now it can.  A unit in that state refuses `systemctl start`
+    # with a generic exit-code error, and the diagnostic below used to blame a
+    # missing installation -- the wrong cause, for a user who has just fixed
+    # their configuration and is trying again.  `cmd_run` has cleared it since
+    # the previous instance of this bug class; the documented start path did not.
+    systemctl --user reset-failed "$AGENT_UNIT" >/dev/null 2>&1 || true
     # Start the user agent service.
     if systemctl --user start "$AGENT_UNIT" 2>/dev/null; then
         if wait_agent_active; then
@@ -1705,7 +1714,7 @@ cmd_start() {
             _info "  journalctl --user -u $AGENT_UNIT -n 20"
         fi
     else
-        _die "Failed to start $AGENT_UNIT. Is it installed? Check: systemctl --user status $AGENT_UNIT"
+        _die "Failed to start $AGENT_UNIT. Is it installed, and does its configuration parse? Check: systemctl --user status $AGENT_UNIT"
     fi
 
     # Try the eBPF system service (optional — degrades gracefully).
@@ -1742,6 +1751,30 @@ cmd_status() {
     fi
     if [ -n "$last_label" ]; then
         printf "  Last label: %s\n" "$last_label"
+    fi
+
+    # Elasticsearch delivery health.  The agent no longer aborts on a failed
+    # startup preflight, so an unreachable or misconfigured endpoint no longer
+    # shows up as a crash-looping unit above.  This line is what replaces that
+    # visibility for an operator who only runs `rigsignal status`.
+    #
+    # -b bounds it to the CURRENT BOOT and the journal timestamp is kept.  Both
+    # matter: in the healthy steady state the agent says nothing at all, so two
+    # hundred lines can reach back weeks, and an outage that ended days ago would
+    # otherwise print here as if it were current state.  The two greps above are
+    # labelled "Last game" and "Last label"; this one would read as now.
+    #
+    # The marker is anchored immediately after the tracing target so an ordinary
+    # game name cannot drift into this line.  That is a narrowing, NOT a
+    # guarantee: these messages are unescaped, so text a user controls can still
+    # contain whatever it likes.  Closing that properly means escaping dynamic
+    # text in the agent's own log output, which changes existing log lines and is
+    # tracked separately.
+    last_delivery=$(journalctl --user -u "$AGENT_UNIT" -b -n 200 -o short-iso --no-pager 2>/dev/null \
+        | grep -E 'WARN rigsignal_agent: ES_DELIVERY ' | tail -1 \
+        | sed -n 's/^\([^ ]*\) .*WARN rigsignal_agent: ES_DELIVERY \(.*\)$/\1  \2/p')
+    if [ -n "$last_delivery" ]; then
+        printf "  Delivery:   %s\n" "$last_delivery"
     fi
 
     printf "\n  Logs:   journalctl --user -u %s -f\n" "$AGENT_UNIT"
