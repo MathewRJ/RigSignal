@@ -54,10 +54,18 @@ const BUILD_COMMIT: &str = env!("RIGSIGNAL_BUILD_COMMIT");
 /// simply be quiet.
 ///
 /// Lines carrying this marker are built only from a timestamp and a count. They
-/// deliberately carry NO error text: `rigsignal status` echoes the most recent
-/// one to stdout, and the errors on this path are wrapped with a context that
-/// interpolates the configured endpoint -- which may itself carry a credential
-/// in a query parameter. Error detail stays in the journal on unmarked lines.
+/// deliberately carry NO error text, and the reason is no longer the one this
+/// comment used to give. The preflight context no longer interpolates the
+/// configured endpoint (see `shipper::ping`), so the outermost layer is now
+/// credential-free on its own.
+///
+/// The split still earns its place for two reasons that outlive that fix:
+/// `rigsignal status` echoes the most recent marked line to stdout, so keeping
+/// it free of variable error text keeps a machine-read line stable; and the
+/// DEEPER layers of the error chain still carry the full request URL, so any
+/// future change from `{}` to `{:#}` or `{:?}` at the unmarked site would put a
+/// query-borne credential back in the journal. Error detail stays on unmarked
+/// lines precisely so that blast radius stays off the stdout-echoed one.
 const ES_DELIVERY_MARKER: &str = "ES_DELIVERY";
 
 /// Minimum gap between repeats of the unreachable warning. The warning is
@@ -1145,11 +1153,15 @@ async fn run() -> Result<ExitCode> {
             // warning for another ES_UNREACHABLE_REPEAT_SECS.
             if let Err(e) = shipper::ping(&cfg).await {
                 let _ = es_health.record_failure(now_unix_secs());
-                // Two lines on purpose. The MARKED one is echoed to stdout by
-                // `rigsignal status`, so it carries no error text: the context on
-                // this path interpolates the configured endpoint, and an endpoint
-                // can carry a credential in a query parameter. The detail stays in
-                // the journal on an unmarked line, exactly where it was before.
+                // Two lines on purpose, and NOT for the reason first written
+                // here: `ping`'s outermost context no longer interpolates the
+                // endpoint, so this rendering is credential-free by itself.
+                //
+                // Keep the split anyway. The MARKED line is echoed to stdout by
+                // `rigsignal status` and must stay machine-stable, and the error's
+                // deeper layers still carry the full request URL -- rendering this
+                // with `{:#}` or `{:?}` instead of `{}` would reach them and put a
+                // query-borne credential back in the journal. Do not merge these.
                 tracing::warn!(
                     "{} startup preflight failed — continuing; documents will be \
                      dropped until Elasticsearch is reachable",
