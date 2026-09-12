@@ -222,8 +222,22 @@ scope=system
 verb="${1-}"; shift
 # Every system-scoped call in cmd_start belongs to ebpf_start, which runs AFTER
 # wait_agent_active; the agent half uses `--user` throughout. So the first
-# system-scoped call is the phase boundary the sleep stub keys on.
-[ "$scope" = system ] && : > "$RS_TEST_STATE/ebpf-phase"
+# system-scoped call is the phase boundary.
+#
+# TWO whole-run quantities have to be scoped here, not one. The sleep COUNTER is
+# what the assertions read. The CLOCK is what the is-active oracle below answers
+# from, and the agent wait advances it before ebpf_start is ever reached -- which
+# silently disarms every clock-keyed scenario: `crashloop` (t -eq 0) and
+# `twotick` (t -lt 2) both stop firing and collapse into the inactive default,
+# so a two-sample streak would ship GREEN. Scoping the counter alone fixes a
+# LOUD failure and leaves a silent one.
+#
+# `[ ! -f ]` is load-bearing: this runs on EVERY system-scoped call, so an
+# unguarded reset would restart the clock at each sample.
+if [ "$scope" = system ] && [ ! -f "$RS_TEST_STATE/ebpf-phase" ]; then
+    : > "$RS_TEST_STATE/ebpf-phase"
+    echo 0 > "$RS_TEST_STATE/clock"
+fi
 t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
 case "$scope:$verb" in
     user:start)     exit 0 ;;
@@ -293,8 +307,14 @@ case "$healthy_out" in
     *"eBPF daemon started"*) ;;
     *) echo "healthy eBPF daemon was not reported as started" >&2; exit 1 ;;
 esac
-# Three consecutive samples means exactly two sleeps between them. wait_agent_active
-# contributes none here because its first sample succeeds.
+# Three consecutive samples means exactly two sleeps between them.
+#
+# This count is eBPF-PHASE-SCOPED (see ebpf_sleeps). It used to read the whole
+# run and was justified by "wait_agent_active contributes none here because its
+# first sample succeeds" -- a premise that expired when the agent wait began
+# requiring consecutive samples, taking this from 2 to 4. Do not reintroduce a
+# whole-run measurement here, and do not fix a mismatch by changing the expected
+# number: the count must measure the eBPF wait alone.
 [ "$(ebpf_sleeps)" -eq 2 ] || {
     echo "healthy scenario took $(ebpf_sleeps) sleeps, expected 2 (three consecutive samples)" >&2
     exit 1
