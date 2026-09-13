@@ -80,8 +80,15 @@ pub fn load_probes(
                 // verbatim. An error chain is not safe to print by default just
                 // because today's causes are benign -- that reasoning is what
                 // failed for the ES ping, where reqwest embedded the full
-                // request URL in its own error. The two ends of a chain are what
-                // an operator reads; the middle is where request detail lives.
+                // request URL in its own error.
+                //
+                // A REVIEW WEAKENED THE RATIONALE AND THE WEAKER VERSION IS THE
+                // HONEST ONE: it is not true that detail lives only in the middle.
+                // `select_variant` bails with a single-layer error whose own text
+                // carries the tracefs path, so a ROOT can be path-bearing here.
+                // What this render buys is therefore bounded -- it drops the
+                // middle, which is where detail ACCUMULATES, rather than
+                // guaranteeing the ends are clean.
                 warn!(
                     "failed to attach probe '{}': {}",
                     probe.name(),
@@ -179,11 +186,15 @@ mod tests {
     use super::attach_failure_reason;
     use anyhow::{anyhow, Context};
 
+    /// SYNTHETIC, and deeper than anything this crate actually produces.
+    ///
+    /// A review established that the real format-error chain has TWO layers, not
+    /// three: `parse_variant_offset` is propagated with a bare `?`, so no
+    /// operation context sits above `parsing <path>`. This fixture adds one, to
+    /// exercise middle-removal at all. Keeping it means keeping it labelled: it
+    /// pins the function's behaviour, not the program's shape.
     #[test]
-    fn keeps_the_diagnosis_and_drops_the_middle() {
-        // The exact shape a non-author review produced as the counterexample to
-        // the plain render: the outermost layer names the FILE, a middle layer
-        // names the operation, and the root names the actual problem.
+    fn drops_a_middle_layer_when_there_is_one() {
         let error = Err::<(), _>(anyhow!("field 'id' has size 4, expected 8"))
             .context("parsing /sys/kernel/tracing/events/gpu_scheduler/format")
             .context("attaching drm_sched_job tracepoint")
@@ -201,13 +212,42 @@ mod tests {
         );
         assert!(
             !rendered.contains("/sys/kernel/tracing"),
-            "a middle layer survived, which is what this render exists to drop: {rendered}"
+            "the middle layer survived, which is what this render exists to drop: {rendered}"
         );
     }
 
+    /// The REAL shape, which is why this change exists.
+    ///
+    /// `parse_key_field_offset` adds `parsing <path>` over a `FormatError` and
+    /// nothing wraps it further, so the chain is exactly two layers: path, then
+    /// diagnosis. There is no middle to drop, and the render is consequently the
+    /// same text the alternate form would produce. That is not a reason to use
+    /// the alternate form -- it is a reason this case is safe either way, while
+    /// the PLAIN render would still lose the diagnosis, which is the regression
+    /// this test exists to catch.
     #[test]
-    fn a_single_layer_error_is_not_duplicated() {
-        let error = anyhow!("PDH error code: 0x800007D5");
-        assert_eq!(attach_failure_reason(&error), "PDH error code: 0x800007D5");
+    fn keeps_the_diagnosis_in_the_real_two_layer_chain() {
+        let error = Err::<(), _>(anyhow!("field 'id' has size 4, expected 8"))
+            .context("parsing /sys/kernel/tracing/events/gpu_scheduler/drm_sched_job/format")
+            .unwrap_err();
+
+        let rendered = attach_failure_reason(&error);
+
+        assert_eq!(
+            rendered,
+            "parsing /sys/kernel/tracing/events/gpu_scheduler/drm_sched_job/format: \
+             field 'id' has size 4, expected 8"
+        );
+    }
+
+    /// `select_variant` bails with a single layer whose text already carries the
+    /// path. Pinned because it is the counterexample to "the ends are clean".
+    #[test]
+    fn a_single_layer_error_is_not_duplicated_even_when_it_carries_a_path() {
+        let error = anyhow!("neither complete gpu_scheduler tracepoint pair is available under /sys/kernel/tracing/events/gpu_scheduler");
+        assert_eq!(
+            attach_failure_reason(&error),
+            "neither complete gpu_scheduler tracepoint pair is available under /sys/kernel/tracing/events/gpu_scheduler"
+        );
     }
 }
