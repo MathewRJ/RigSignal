@@ -1,0 +1,124 @@
+name: public-text
+
+# This repository is public and its history is permanent. Commit and annotated
+# tag messages must not carry operator-environment detail.
+#
+# The job runs UNCONDITIONALLY. It does not ask the API whether the repository
+# is public and branch on the answer: a check that decides whether to check is
+# a check that can decide not to, and the failure mode is silent.
+#
+# Rules live in .github/lint/public-text-rules.json, which is the single source
+# of truth so that private tooling can consume the same file rather than keep a
+# second copy that drifts.
+#
+# SCOPE, stated here so a green run is not read as more than it is: this covers
+# GENERIC classes only — session identifiers, private addresses, home and
+# checkout paths, MAC addresses, logins paired with IP literals. It does NOT
+# cover organisation-specific hostnames or internal identifier prefixes, because
+# a denylist of those committed to a public repository would publish exactly the
+# naming it exists to keep out. Those checks belong in private tooling.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-text-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  public-text:
+    name: public text
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Full history and tags: the range walk needs the merge base, and tag
+          # bodies are not fetched by a shallow clone at all.
+          fetch-depth: 0
+
+      # The control must be proven ARMED before its verdict means anything.
+      #
+      # An earlier implementation of this idea had 22 green tests and could not
+      # detect its own removal: changing the final exit to 0 left every test
+      # passing, because the tests asserted the rule function's output rather
+      # than the gate's effect. These two steps assert the effect.
+      - name: Self-test — every seeded leak is caught, every clean message passes
+        run: python3 .github/lint/public_text_lint.py --selftest
+
+      - name: Self-test — a seeded leak actually FAILS the checker
+        run: |
+          set -euo pipefail
+          lint="$GITHUB_WORKSPACE/.github/lint/public_text_lint.py"
+          seeded="$(mktemp -d)/seeded"
+          git init -q "$seeded"
+          cd "$seeded"
+          git config user.email t@example.com
+          git config user.name T
+          # The BASE commit must be clean and the leak must land ABOVE it.
+          # `base..head` EXCLUDES base, so seeding the leak into the root commit
+          # puts it outside the range the checker walks -- the first version of
+          # this step did exactly that and reported the gate armed while the
+          # checker had never seen the leak at all.
+          git commit -q --allow-empty -m "base: clean"
+          base="$(git rev-parse HEAD)"
+          git commit -q --allow-empty -m "seeded: host 192.168.1.1 must be refused"
+
+          set +e
+          python3 "$lint" --base "$base" --head HEAD
+          leak_rc=$?
+          set -e
+          if [ "$leak_rc" -eq 0 ]; then
+            echo "ARMED CHECK FAILED: a seeded leak did not fail the checker."
+            echo "The gate is not gating. Do not trust a green run from this job."
+            exit 1
+          fi
+
+          # And the other direction: a clean commit above the leak must PASS, or
+          # the job would be one that fails everything, which is indistinguishable
+          # from a working gate when you only ever test the failing case.
+          git commit -q --allow-empty -m "clean: no environment detail here"
+          set +e
+          python3 "$lint" --base HEAD~1 --head HEAD
+          clean_rc=$?
+          set -e
+          if [ "$clean_rc" -ne 0 ]; then
+            echo "ARMED CHECK FAILED: a clean message was refused (rc $clean_rc)."
+            exit 1
+          fi
+          echo "armed: seeded leak exits $leak_rc, clean message exits $clean_rc"
+
+      - name: Lint commit messages introduced by this change
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE:-}" ]; then
+            base="$BASE"
+          else
+            # A push: lint what this push added. before is all-zero for a new
+            # ref, in which case fall back to the merge base with main so a new
+            # branch does not lint the entire published history.
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git merge-base origin/main HEAD || git rev-list --max-parents=0 HEAD | tail -1)"
+            else
+              base="$before"
+            fi
+          fi
+          echo "range: $base..${HEAD}"
+          python3 .github/lint/public_text_lint.py --base "$base" --head "$HEAD"
+
+      - name: Lint annotated tag messages
+        # Separate from the commit walk on purpose: `git log` on a tag peels to
+        # the tagged commit and never reads the tag's own body, so a tag placed
+        # on an already-published commit produces an empty range and reports
+        # clean while its message ships anything at all.
+        run: python3 .github/lint/public_text_lint.py --tags
