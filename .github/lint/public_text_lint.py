@@ -392,11 +392,11 @@ def main() -> int:
         "cannot be checked here without publishing them in this repository, so\n"
         "they belong in private tooling."
     )
-    gaps = rules.get("known_gaps", {}).get("gaps", [])
-    if gaps:
-        print("\nAlso not covered, each graded for whether it arises by accident:")
-        for gap in gaps:
-            print(f"  {gap['id']} ({gap['arises']})")
+    # The declared known gaps are deliberately NOT printed here. This output
+    # reaches every author who trips the gate, and listing the blind spots on
+    # every failure republishes them far wider than the people evaluating the
+    # gate. They live in the rules file and in the workflow header, which is
+    # where a reviewer or an owner reads them.
     return 1
 
 

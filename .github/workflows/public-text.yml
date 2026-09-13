@@ -17,6 +17,29 @@ name: public-text
 # cover organisation-specific hostnames or internal identifier prefixes, because
 # a denylist of those committed to a public repository would publish exactly the
 # naming it exists to keep out. Those checks belong in private tooling.
+#
+# KNOWN GAPS, declared here and in `known_gaps` in the rules file. They are
+# deliberately NOT printed in the per-run failure output: that reaches every
+# author who trips the gate, and listing the blind spots on every failure
+# republishes them far wider than the people evaluating the gate. A reviewer or
+# an owner reads this header; a tripped author does not need it.
+#
+# Each was graded for whether it arises BY ACCIDENT — which this gate should
+# catch — or only BY INTENT, which a commit-message lint cannot usefully defend
+# against, since the same author controls the text:
+#
+#   line-split-address        by accident        a body wrap can break inside a
+#                                                line containing an address
+#   fullwidth-unicode-digits  by accident        an IME left in fullwidth mode
+#   percent-encoded-forms     sometimes          plausible for a pasted URL or
+#                                                log line; not for a hand-typed
+#                                                bare address
+#   decimal-hex-octal-ipv4    mostly by intent   narrow for this toolchain
+#
+# The first two were promoted from adversarial to ordinary-use in review. Neither
+# is handled: joining wrapped lines risks fusing unrelated tokens, and Unicode
+# normalisation widens every rule's blast radius. Both are design decisions, not
+# patches.
 
 on:
   pull_request:
