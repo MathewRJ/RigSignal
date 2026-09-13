@@ -481,6 +481,23 @@ SH
 # and it fires everywhere because a loop that does not space its samples
 # invalidates every scenario at once.
 #
+# COLUMN LABELS ARE ABBREVIATED; the real scenario strings are `counterreset`
+# (shown as reset) and `nonrestarts` (shown as norestarts). Spelled out because
+# `norestarts` differs from the real value by one letter, which reads as a name
+# rather than as an abbreviation and sends a reader looking for a scenario that
+# does not exist.
+#
+# ONE ROW THIS TABLE DOES NOT CARRY, recorded rather than silently dropped. A
+# retracted earlier version of this table had a `counter fail-closed when absent`
+# row, CATCHing on nonrestarts alone -- the property `expect_start nonrestarts`
+# names, that an absent NRestarts reading must DEGRADE and never fail closed.
+# There is no equivalent row here: this table's `any counter CHANGE is failure`
+# row targets the inner comparison, not the outer empty-check. The row is NOT
+# reinstated because it has not been re-measured on this revision, and a coverage
+# row asserted without measurement is the exact defect that made the earlier table
+# worth retracting. The scenario itself still runs and still enforces the
+# property; only its mutation evidence is missing.
+#
 # The full-revert row is deliberately not all CATCH: the old code succeeded for
 # a healthy unit, a reset counter, an absent counter and a slow start, and those
 # four cells SHOULD stay `.`. Only the three crash-loop scenarios distinguish the
@@ -506,26 +523,6 @@ echo $((n + 1)) > "$RS_TEST_STATE/sleeps"
 exit 0
 SH
 
-# Coverage, MEASURED by mutating one statement of the fix at a time and running
-# each scenario ALONE (the suite stops at its first failure, so a whole-suite run
-# credits scenarios that never executed). CATCH = that scenario goes red.
-#
-#   mutation                           healthy fastloop slowfail twotick norestarts latestart
-#   streak -ge 3 -> -ge 2                 .       .      CATCH    CATCH      .         .
-#   restart-counter check deleted         .       .      CATCH      .        .         .
-#   counter fail-closed when absent       .       .        .        .      CATCH       .
-#   poll bound -lt 12 -> -lt 10           .       .        .        .        .       CATCH
-#   exit status reverted to always 0      .     CATCH    CATCH    CATCH      .         .
-#   whole fix reverted                  CATCH   CATCH    CATCH    CATCH    CATCH       .
-#
-# Read it this way: twotick is what pins the sample count at three rather than
-# two -- fastloop's active window is one sample wide and cannot tell those
-# apart, so without twotick the constant would be unguarded. slowfail catches a
-# weakened streak as well as a deleted counter, because the counter can only
-# observe a restart if the loop is still sampling when it happens; the two
-# halves are not independent. latestart is the only guard on the poll bound, and
-# it does not catch a full revert -- correctly, since the old code accepted a
-# slow start too.
 cat > "$start_tmp/bin/systemctl" <<'SH'
 #!/bin/sh
 t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
