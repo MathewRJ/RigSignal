@@ -449,6 +449,14 @@ mod tests {
             "https://es.example:9200",
             "https://es.example:9200/",
             "http://127.0.0.1:9200",
+            // IPv6, because without it this test was blind to the defect that
+            // matters most here: a clean endpoint rendered as `[[::1]]` would be a
+            // SILENT corruption that still looks like an endpoint, where the
+            // path-bearing case at least renders a visible `<redacted>`. A
+            // non-author review found it by round-tripping --print-config output
+            // back into a config file, where it failed as "invalid IPv6 address".
+            "https://[::1]:9443",
+            "http://[2001:db8::1]:9200",
         ] {
             let cfg: Config =
                 toml::from_str(&format!("[elasticsearch]\nendpoint = '{endpoint}'\n")).unwrap();
