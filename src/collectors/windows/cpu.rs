@@ -91,7 +91,7 @@ impl CpuCollector {
                 self.initialized = true;
             }
             Err(e) => {
-                tracing::warn!("CpuCollector PDH init failed: {e:#}; will return Ok(None)");
+                tracing::warn!("CpuCollector PDH init failed: {e}; will return Ok(None)");
             }
         }
     }
@@ -132,7 +132,7 @@ impl Collector for CpuCollector {
         };
 
         if let Err(e) = query.collect() {
-            tracing::warn!("CpuCollector PDH collect failed: {e:#}");
+            tracing::warn!("CpuCollector PDH collect failed: {e}");
             return Ok(None);
         }
 
