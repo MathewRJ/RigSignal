@@ -2063,7 +2063,9 @@ mod tests {
         );
         // A `'('` char literal does not inflate the depth.
         assert!(
-            bodies.iter().any(|b| b.contains("a char literal") && b.ends_with("'('")),
+            bodies
+                .iter()
+                .any(|b| b.contains("a char literal") && b.ends_with("'('")),
             "char literal mis-consumed: {bodies:?}"
         );
         // Nested calls are spanned whole.
