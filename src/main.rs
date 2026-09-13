@@ -2122,20 +2122,33 @@ mod tests {
         );
 
         // ── No alternate error formatting, at ANY position ───────────────────
-        // `{:#}` prints every cause verbatim. So does `{:?}`, which ALSO spans
-        // lines -- it is simultaneously the credential leak and the forged
-        // second line that `error_for_log_never_emits_a_forged_second_line`
-        // exists to prevent. The previous revision blocked only `{:#}`, while the
-        // comment at the preflight site named `{:?}` as equally harmful; a guard
-        // must not be narrower than the hazard its own neighbours describe.
-        // `{:#?}` contains neither of the other two as a substring, so all three
-        // are listed.
+        // The alternate render prints every cause verbatim. So does the debug
+        // render, which ALSO spans lines -- it is simultaneously the credential
+        // leak and the forged second line that
+        // `error_for_log_never_emits_a_forged_second_line` exists to prevent. An
+        // earlier revision blocked only the alternate one, while the comment at the
+        // preflight site named debug as equally harmful; a guard must not be
+        // narrower than the hazard its own neighbours describe.
+        //
+        // MATCH THE CLOSING FORM, NOT THE WHOLE PLACEHOLDER. Rust's inline capture
+        // writes the argument inside the braces -- `{e:#}`, not `{:#}` -- so the
+        // earlier list of whole placeholders could not see it. Measured: appending
+        // `{e:#}` to a site whose allowlist entry matches by PREFIX left this guard
+        // GREEN. The runtime integration test did catch that particular case, but
+        // this guard exists for the faults the runtime tests cannot see, so being
+        // covered there is luck rather than design. `{e:#}` is also the exact form
+        // that reached a live surface in `diagnose`.
+        //
+        // The three closing forms are listed separately because none contains
+        // another as a substring.
         for (line_no, body) in &sites {
-            for spec in ["{:#}", "{:?}", "{:#?}"] {
+            for spec in [":#}", ":?}", ":#?}"] {
                 assert!(
                     !body.contains(spec),
-                    "line {line_no} uses `{spec}`, which prints every cause \
-                     verbatim: {body}"
+                    "line {line_no} uses an alternate/debug render ending `{spec}`, \
+                     which prints every cause verbatim. This matches the inline \
+                     capture form (`{{e:#}}`) as well as the bare one (`{{:#}}`): \
+                     {body}"
                 );
             }
         }
