@@ -293,10 +293,35 @@ impl Config {
         )
     }
 
+    /// The configured endpoint reduced to a bare `scheme://host[:port]` origin,
+    /// or the literal `<redacted>` when it cannot be shown to be credential-free.
+    ///
+    /// `endpoint` is an unvalidated bare `String` that need not be a URL at all,
+    /// and it may carry a credential in userinfo or in a query parameter. The
+    /// reduction REJECTS rather than sanitises, so anything it cannot prove clean
+    /// is withheld entirely.
+    ///
+    /// NOTE THE COST, because it is not free: an endpoint with a path -- a
+    /// legitimate reverse-proxied deployment, say `https://host/es/` -- is not
+    /// provably credential-free by this test and renders as `<redacted>` too. The
+    /// operator loses the host in that case. That is the conservative direction
+    /// and it is deliberate, but it is a real diagnostic loss, not a free win.
+    pub fn endpoint_for_display(&self) -> String {
+        crate::handshake::endpoint_origin(&self.elasticsearch.endpoint)
+            .unwrap_or_else(|| "<redacted>".to_string())
+    }
+
     /// Return a clone suitable for display: api_key / username / password are
-    /// replaced with "<redacted>" so the output is safe to print or log.
+    /// replaced with "<redacted>", and the endpoint is reduced by
+    /// `endpoint_for_display`, so the output is safe to print or log.
+    ///
+    /// The endpoint reduction was added after a review found this helper's NAME
+    /// was doing the work its CODE did not: it redacted three fields and left the
+    /// endpoint raw, and a caller printed that raw endpoint under a heading that
+    /// read as redacted.
     pub fn redacted_for_display(&self) -> Self {
         let mut out = self.clone();
+        out.elasticsearch.endpoint = self.endpoint_for_display();
         let es = &mut out.elasticsearch;
         if es.api_key.is_some() {
             es.api_key = Some("<redacted>".to_string());
@@ -394,6 +419,57 @@ mod tests {
     #[cfg(not(windows))]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     static SPOOL_RETENTION_WARN_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn redacted_for_display_withholds_an_endpoint_it_cannot_prove_clean() {
+        // A credential in userinfo AND one in a query parameter. Neither may
+        // survive into a printed or logged config.
+        let cfg: Config = toml::from_str(
+            "[elasticsearch]\nendpoint = 'https://u:hunter2@es.example:9200/?api_key=CANARY'\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.endpoint_for_display(), "<redacted>");
+
+        let shown = cfg.redacted_for_display();
+        let rendered = toml::to_string_pretty(&shown).unwrap();
+        for leak in ["hunter2", "CANARY", "u:hunter2"] {
+            assert!(
+                !rendered.contains(leak),
+                "redacted config still carries {leak}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_for_display_keeps_an_endpoint_that_is_provably_clean() {
+        // The common case must NOT be degraded: a bare origin survives verbatim,
+        // otherwise this change would cost every operator their endpoint.
+        for endpoint in [
+            "https://es.example:9200",
+            "https://es.example:9200/",
+            "http://127.0.0.1:9200",
+        ] {
+            let cfg: Config =
+                toml::from_str(&format!("[elasticsearch]\nendpoint = '{endpoint}'\n")).unwrap();
+            assert_eq!(
+                cfg.endpoint_for_display(),
+                endpoint.trim_end_matches('/'),
+                "clean endpoint was degraded: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_for_display_withholds_a_path_bearing_endpoint_and_that_is_a_real_cost() {
+        // Documenting the CONSEQUENCE, not celebrating it. A reverse-proxied
+        // deployment is credential-free but not provably so by this test, and the
+        // operator loses the host from the report. If that becomes a support
+        // burden, the fix is a richer reduction, not printing the raw value.
+        let cfg: Config =
+            toml::from_str("[elasticsearch]\nendpoint = 'https://host/es/'\n").unwrap();
+        assert_eq!(cfg.endpoint_for_display(), "<redacted>");
+    }
 
     #[derive(Clone)]
     struct WarnCounter(Arc<AtomicUsize>);
