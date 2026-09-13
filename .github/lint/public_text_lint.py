@@ -270,6 +270,12 @@ SELFTEST_CASES = [
     ("nic 0a1b.2c3d.4e5f flapped", "mac-address"),
     ("built in ${HOME}/coding/thing", "tilde-checkout-path"),
     ("moved /home//someone/project/file.rs", "absolute-home-path"),
+    # The glob exemption must NOT reach a home path: in /home/<user>/ the matched
+    # span IS the identity, and a glob later in the path cannot change that. A
+    # review found the first version suppressed a real username here, in prose as
+    # ordinary as cleaning up a cache directory.
+    ("moved /home/realuser/project* to storage", "absolute-home-path"),
+    ("cleaned up /home/someone/.cache/thing-* before rebuilding", "absolute-home-path"),
 ]
 
 SELFTEST_CLEAN = [
@@ -280,6 +286,9 @@ SELFTEST_CLEAN = [
     # A glob is a discovery TEMPLATE and names nothing. Real false positive on a
     # real commit, found by running against history rather than fixtures.
     "fix: search ~/elastic/elastic-agent-*/ for the binary\n",
+    # The tilde form keeps the exemption: `~` already denotes the current user, so
+    # the segment after it is a directory name and carries no identity.
+    "fix: probe ~/vendor/product-*/bin for the tool\n",
     # A message ending in a blank line leaves paragraphs[-1] empty; the real
     # trailer is one element back and must still be exempted.
     "fix: something\n\nCo-Authored-By: Someone <someone@example.com>\n\n",
@@ -383,6 +392,11 @@ def main() -> int:
         "cannot be checked here without publishing them in this repository, so\n"
         "they belong in private tooling."
     )
+    gaps = rules.get("known_gaps", {}).get("gaps", [])
+    if gaps:
+        print("\nAlso not covered, each graded for whether it arises by accident:")
+        for gap in gaps:
+            print(f"  {gap['id']} ({gap['arises']})")
     return 1
 
 

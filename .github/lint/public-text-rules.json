@@ -98,10 +98,35 @@
     }
   },
   "glob_exemption": {
-    "why": "A path containing a literal '*' is a discovery TEMPLATE, not a location. It names neither a user nor a machine. Found in review as a false positive on a real commit referencing an installation-directory glob.",
+    "why": "A path containing a literal '*' is a discovery TEMPLATE, not a location. Found in review as a false positive on a real commit referencing an installation-directory glob.",
+    "why_not_home_paths": "Applied to tilde paths ONLY, and the asymmetry is the point. In '/home/<user>/' the MATCHED SPAN IS THE IDENTITY -- a glob later in the path cannot make the username stop being a username. In '~/<segment>/' the '~' already denotes the current user and the segment is just a directory name, so the match carries no identity to leak. Exempting both was a REJECT: a review showed that ordinary prose such as cleaning up a cache directory with a trailing glob suppressed a real username, which is more realistic than the false positive the exemption was added to remove.",
     "applies_to": [
-      "tilde-checkout-path",
-      "absolute-home-path"
+      "tilde-checkout-path"
+    ]
+  },
+  "known_gaps": {
+    "why": "Stated so a pass is not read as more than it is. A reviewer graded each of these for whether it arises by ACCIDENT (which this gate should catch) or only by INTENT (which a commit-message lint cannot usefully defend against, since the same author controls the text). Two were promoted from adversarial to ordinary-use by that review and are recorded here rather than silently kept out.",
+    "gaps": [
+      {
+        "id": "line-split-address",
+        "arises": "by accident",
+        "note": "An ordinary 72-column body wrap can break inside a line containing an address. Mechanical, not chosen. The reviewer's strongest disagreement with treating it as adversarial. NOT handled: joining lines before scanning risks fusing unrelated tokens, so it needs a design decision rather than a quick patch."
+      },
+      {
+        "id": "fullwidth-unicode-digits",
+        "arises": "by accident",
+        "note": "A CJK IME left in fullwidth mode is a documented accidental-input class. NOT handled: needs Unicode normalisation before matching, which widens the blast radius of every rule."
+      },
+      {
+        "id": "percent-encoded-forms",
+        "arises": "sometimes by accident",
+        "note": "Pasting an already-encoded URL or log line is plausible for the session-url and path forms; a hand-typed percent-encoded bare address in prose is not. Split verdict: the URL/path sub-case is ordinary, the bare-address sub-case adversarial."
+      },
+      {
+        "id": "decimal-hex-octal-ipv4",
+        "arises": "mostly by intent",
+        "note": "The accidental route is pasting raw output from a tool that renders addresses as integers. Real but narrow for this project's toolchain. Lowest priority."
+      }
     ]
   }
 }
