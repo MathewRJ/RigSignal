@@ -204,7 +204,15 @@ cat > "$ebpf_tmp/bin/sudo" <<'SH'
 # Drop sudo's own options and run the rest through the shim PATH, so the
 # systemctl shim answers. Records whether -n was used, because the wait samples
 # must be non-interactive.
-[ "${1-}" = "-n" ] && printf 'n\n' >> "$RS_TEST_STATE/sudo-n"
+# Record EVERY invocation and whether it was non-interactive, not only the
+# compliant ones. Recording only the `-n` calls means an interactive call
+# leaves NO trace, so the assertion can only fail by a call being absent --
+# it cannot fail by a call being wrong, which is the case that matters.
+if [ "${1-}" = "-n" ]; then
+    printf 'n\n' >> "$RS_TEST_STATE/priv-calls"
+else
+    printf 'interactive\n' >> "$RS_TEST_STATE/priv-calls"
+fi
 while [ $# -gt 0 ]; do
     case "$1" in
         -*) shift ;;
@@ -223,6 +231,14 @@ verb="${1-}"; shift
 # Every system-scoped call in cmd_start belongs to ebpf_start, which runs AFTER
 # wait_agent_active; the agent half uses `--user` throughout. So the first
 # system-scoped call is the phase boundary.
+#
+# THAT HOLDS FOR cmd_start ONLY, and these stubs are PATH-wide. cmd_setup and
+# cmd_status also make system-scoped calls, so reusing this fixture to exercise
+# either would set the phase marker from one of THOSE calls and mis-attribute
+# every sleep after it to the eBPF wait. The scenarios below are all cmd_start,
+# which is what makes the boundary sound here. Anyone pointing these stubs at
+# another subcommand must re-derive the boundary first -- it is a property of
+# the code under test, not of the shim.
 #
 # TWO whole-run quantities have to be scoped here, not one. The sleep COUNTER is
 # what the assertions read. The CLOCK is what the is-active oracle below answers
@@ -340,8 +356,43 @@ esac
     exit 1
 }
 # Every sample must be non-interactive; a wait that prompts would hang a start.
-[ -s "$ebpf_tmp/state/sudo-n" ] || { echo "eBPF wait sampled without sudo -n" >&2; exit 1; }
+# SCOPE, and this comment previously committed the very defect R6 fixes above.
+# It read "every sample must be non-interactive", stated as a property of the
+# launcher. That is false of the launcher: ebpf_start DELIBERATELY falls back to
+# a non-`-n` privileged call when the first one fails, and this shim records
+# every privileged invocation, not only wait samples. Measured: in the `nostart`
+# scenario priv-calls reads `n` then `interactive`.
+#
+# The assertion is sound because it is evaluated against the HEALTHY run's state
+# only -- each run_ebpf_scenario wipes the state dir. So the claim is "the healthy
+# start path never prompts", NOT "no privileged call is ever interactive".
+# Widening this to every scenario would red on shipped, deliberate behaviour.
+[ -s "$ebpf_tmp/state/priv-calls" ] || {
+    echo "no privileged invocation was recorded at all, so the non-interactive check below measured nothing" >&2
+    exit 1
+}
+if grep -q interactive "$ebpf_tmp/state/priv-calls"; then
+    echo "a privileged invocation was INTERACTIVE; a wait that prompts would hang a start" >&2
+    exit 1
+fi
 # And the samples must be a second apart, not zero.
+# The file must EXIST before its contents are judged. A failing command
+# substitution inside a `case` word does not trip `set -euo pipefail`, so an
+# absent file would fall through to the default arm and blame sample SPACING --
+# a wrong diagnosis for a missing measurement. Today that is unreachable only
+# because the count assertion above exits first, i.e. it is protected by the
+# ORDER of two assertions rather than by anything structural.
+# -s, not -f: a file that EXISTS BUT IS EMPTY passes -f, reaches the case below
+# with an empty word, and lands on exactly the wrong-diagnosis arm this guard
+# exists to prevent. Not reachable today -- but `expect_start` 200 lines below
+# already uses `: > .../durations` as its per-scenario reset, so an empty-file
+# initialiser for this one is the obvious next edit, and it would restore the
+# defect while leaving the guard green. The sibling assertion above already uses
+# -s; using the weaker primitive here was an inconsistency, not a decision.
+[ -s "$ebpf_tmp/state/durations-ebpf" ] || {
+    echo "no eBPF sleep durations were recorded, so sample spacing was never measured" >&2
+    exit 1
+}
 case "$(sort -u "$ebpf_tmp/state/durations-ebpf")" in
     1) ;;
     *) echo "eBPF wait did not space its samples by one second" >&2; exit 1 ;;
@@ -602,6 +653,23 @@ SH
 # and it fires everywhere because a loop that does not space its samples
 # invalidates every scenario at once.
 #
+# COLUMN LABELS ARE ABBREVIATED; the real scenario strings are `counterreset`
+# (shown as reset) and `nonrestarts` (shown as norestarts). Spelled out because
+# `norestarts` differs from the real value by one letter, which reads as a name
+# rather than as an abbreviation and sends a reader looking for a scenario that
+# does not exist.
+#
+# ONE ROW THIS TABLE DOES NOT CARRY, recorded rather than silently dropped. A
+# retracted earlier version of this table had a `counter fail-closed when absent`
+# row, CATCHing on nonrestarts alone -- the property `expect_start nonrestarts`
+# names, that an absent NRestarts reading must DEGRADE and never fail closed.
+# There is no equivalent row here: this table's `any counter CHANGE is failure`
+# row targets the inner comparison, not the outer empty-check. The row is NOT
+# reinstated because it has not been re-measured on this revision, and a coverage
+# row asserted without measurement is the exact defect that made the earlier table
+# worth retracting. The scenario itself still runs and still enforces the
+# property; only its mutation evidence is missing.
+#
 # The full-revert row is deliberately not all CATCH: the old code succeeded for
 # a healthy unit, a reset counter, an absent counter and a slow start, and those
 # four cells SHOULD stay `.`. Only the three crash-loop scenarios distinguish the
@@ -627,26 +695,6 @@ echo $((n + 1)) > "$RS_TEST_STATE/sleeps"
 exit 0
 SH
 
-# Coverage, MEASURED by mutating one statement of the fix at a time and running
-# each scenario ALONE (the suite stops at its first failure, so a whole-suite run
-# credits scenarios that never executed). CATCH = that scenario goes red.
-#
-#   mutation                           healthy fastloop slowfail twotick norestarts latestart
-#   streak -ge 3 -> -ge 2                 .       .      CATCH    CATCH      .         .
-#   restart-counter check deleted         .       .      CATCH      .        .         .
-#   counter fail-closed when absent       .       .        .        .      CATCH       .
-#   poll bound -lt 12 -> -lt 10           .       .        .        .        .       CATCH
-#   exit status reverted to always 0      .     CATCH    CATCH    CATCH      .         .
-#   whole fix reverted                  CATCH   CATCH    CATCH    CATCH    CATCH       .
-#
-# Read it this way: twotick is what pins the sample count at three rather than
-# two -- fastloop's active window is one sample wide and cannot tell those
-# apart, so without twotick the constant would be unguarded. slowfail catches a
-# weakened streak as well as a deleted counter, because the counter can only
-# observe a restart if the loop is still sampling when it happens; the two
-# halves are not independent. latestart is the only guard on the poll bound, and
-# it does not catch a full revert -- correctly, since the old code accepted a
-# slow start too.
 cat > "$start_tmp/bin/systemctl" <<'SH'
 #!/bin/sh
 t=$(cat "$RS_TEST_STATE/clock" 2>/dev/null || echo 0)
@@ -697,8 +745,14 @@ expect_start() {   # $1 = scenario, $2 = ok|notok, $3 = description
         case "$_d" in
             ""|*[!0-9.]*) echo "start/$scenario ($desc): sleep called with a non-numeric duration: '$_d'" >&2; exit 1 ;;
         esac
-        awk -v v="$_d" 'BEGIN { exit !(v + 0 >= 1) }' || {
-            echo "start/$scenario ($desc): wait loop slept ${_d}s — samples are not separated by the required second" >&2
+        # EXACTLY one second, not merely at least one. `>= 1` left the agent
+        # half unpinned: changing its `sleep 1` to `sleep 2` reddened nothing
+        # here, and nothing in the eBPF block either, because that block's
+        # duration assertion is scoped to eBPF sleeps. Tightening HERE is the
+        # repair; re-widening the eBPF assertion is not, because that restores
+        # exactly the whole-run coupling whose removal this scoping achieved.
+        awk -v v="$_d" 'BEGIN { exit !(v + 0 == 1) }' || {
+            echo "start/$scenario ($desc): wait loop slept ${_d}s, expected exactly 1 — samples are not separated by the required second" >&2
             exit 1
         }
     done < "$start_tmp/state/durations"
