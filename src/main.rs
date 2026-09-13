@@ -1977,6 +1977,277 @@ mod tests {
         );
     }
 
+    /// Every `.rs` file under the crate root that is production source.
+    ///
+    /// Read from the filesystem at test time rather than enumerated with
+    /// `include_str!`, because a hand-written list is exactly the thing that goes
+    /// stale: a module added next month would simply not be covered, and nothing
+    /// would say so. `CARGO_MANIFEST_DIR` is a compile-time constant pointing at
+    /// this crate's own directory, so the walk finds the sources this binary was
+    /// built from.
+    fn rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if path.is_dir() {
+                    // `tests/` holds integration tests, `target/` build output.
+                    if name == "tests" || name == "target" || name.starts_with('.') {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if name.ends_with(".rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Everything before the TOP-LEVEL `#[cfg(test)]`, or the whole file.
+    ///
+    /// Anchored to a line start so an INDENTED `#[cfg(test)]` cannot cut the file
+    /// early, and so it holds under CRLF -- both traps are recorded on the guard
+    /// above, one of which only CI on Windows could see.
+    fn production_region(src: &str) -> &str {
+        match src
+            .match_indices("#[cfg(test)]")
+            .find(|(i, _)| *i == 0 || src.as_bytes()[i - 1] == b'\n')
+        {
+            Some((i, _)) => &src[..i],
+            None => src,
+        }
+    }
+
+    /// TREE-WIDE: no production source anywhere in this crate may render an error
+    /// with the ALTERNATE form.
+    ///
+    /// The guard above covers this file and fully-qualified `tracing::` calls only.
+    /// This one covers every module, and deliberately bans a NARROWER set of specs
+    /// so it can: the alternate Display `{:#}` and the alternate Debug `{:#?}`,
+    /// in every spelling including inline capture, and NOT the plain debug `{:?}`.
+    ///
+    /// WHY THE DEBUG RENDER IS LEFT OUT, since a wider ban looks strictly safer:
+    /// `{:?}` on a `Path` or a `PathBuf` is the idiomatic way to print one, and
+    /// `session.rs` alone has about ten such sites -- all benign. Banning it
+    /// tree-wide would red on all of them, and the obvious repair, listing them as
+    /// exemptions, would add ten waiver rows and dilute the guard toward the
+    /// documented-exemption failure this codebase has logged before. The debug ban
+    /// therefore stays local to the file whose sites are all error renders. The
+    /// alternate forms have no such benign use: `{:#x}`, `{:#b}` and `{:#o}` end in
+    /// different closing forms and are unaffected.
+    ///
+    /// ALTERNATE DEBUG IS INCLUDED even though it is half a debug render, because
+    /// `:#?}` contains neither of the other closing forms as a substring, so
+    /// leaving it out would reopen exactly the evasion this predicate was widened
+    /// to close -- for no benefit, there being zero uses of it anywhere.
+    ///
+    /// WHAT THIS DOES NOT CATCH, and the first item is the incident that motivated
+    /// the whole line of work, so read it before trusting this guard:
+    ///   * An alternate render performed in a `format!` whose result is then passed
+    ///     to a log macro. That is precisely how the endpoint reached the journal
+    ///     from `diagnose`. This check does catch it, because it scans production
+    ///     source rather than macro bodies -- but only because it is a TEXT scan of
+    ///     the whole region. Move the `format!` into a helper in a file this walk
+    ///     skips and it is invisible again.
+    ///   * A fill or align character before the flag (`{e:>#}`), which needs a real
+    ///     parse of the format spec rather than a substring match.
+    ///   * Tracing's `?field` Debug shorthand, which is not a format spec at all.
+    ///     Measured at the time of writing: zero such sites in production source.
+    ///   * Anything reached through a `Display` impl that itself renders a cause
+    ///     chain.
+    ///   * ANY SOURCE OUTSIDE THIS CRATE. The walk starts at `CARGO_MANIFEST_DIR`,
+    ///     so it covers this crate and nothing else. The eBPF daemon is a separate
+    ///     Cargo workspace in a sibling directory and is NOT walked -- and it does
+    ///     contain such a site, in its probe loader. Stated rather than left to be
+    ///     discovered, because "the tree-wide guard passes" will otherwise be read
+    ///     as "the repository is clean", and the repository is larger than the
+    ///     crate.
+    #[test]
+    fn no_production_source_renders_an_error_with_the_alternate_form() {
+        const ALTERNATE_SPECS: [&str; 2] = [":#}", ":#?}"];
+
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let files = rust_sources(&root);
+
+        // Assert the SETUP. Every assertion below is an ABSENCE check, and an
+        // absence check over an empty or truncated file list passes while proving
+        // nothing at all.
+        assert!(
+            files.len() >= 20,
+            "the source walk found only {} files under {}; an absence check over \
+             too few files is vacuous",
+            files.len(),
+            root.display()
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("main.rs")),
+            "the walk did not find main.rs, so it is not looking where it thinks"
+        );
+        let mut scanned_bytes = 0usize;
+
+        let mut findings = Vec::new();
+        for path in &files {
+            let raw = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            let region = strip_comments(production_region(&raw));
+            scanned_bytes += region.len();
+            for (index, line) in region.lines().enumerate() {
+                for spec in ALTERNATE_SPECS {
+                    if line.contains(spec) {
+                        let shown = path.strip_prefix(&root).unwrap_or(path);
+                        findings.push(format!("{}:{} {}", shown.display(), index + 1, line.trim()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            scanned_bytes > 100_000,
+            "only {scanned_bytes} bytes of production source were scanned; the cut \
+             or the stripper has eaten the corpus"
+        );
+        assert!(
+            findings.is_empty(),
+            "production source renders an error with the alternate form, which \
+             prints every cause verbatim -- the mechanism by which a configured \
+             endpoint reached the journal. Render with `{{}}` and let the outermost \
+             context carry the message:\n{}",
+            findings.join("\n")
+        );
+    }
+
+    /// Replace every Rust comment with spaces, preserving newlines so line numbers
+    /// survive.
+    ///
+    /// Needed because the hazard this file guards against is DISCUSSED in prose all
+    /// over this codebase -- the non-test region of this very file names `{:#}` in
+    /// four comments -- so a scan that cannot tell code from commentary would fire
+    /// on the documentation of the rule it enforces.
+    ///
+    /// Tracks string and char literals so a `//` inside a string is not mistaken
+    /// for the start of a comment. Raw strings (`r"..."`, `r#"..."#`) are NOT
+    /// handled: a `\` inside one is treated as an escape, which can only make the
+    /// stripper consume MORE than it should and so can only produce a false
+    /// negative in a file containing one. None of the files walked here contains a
+    /// raw string with a quote in it; the test below pins the cases that matter.
+    fn strip_comments(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        let (mut in_str, mut in_char, mut escaped) = (false, false, false);
+        let mut block_depth = 0usize;
+        let mut in_line = false;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            let next = bytes.get(i + 1).map(|b| *b as char);
+            if in_line {
+                if c == '\n' {
+                    in_line = false;
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+                continue;
+            }
+            if block_depth > 0 {
+                if c == '/' && next == Some('*') {
+                    block_depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '*' && next == Some('/') {
+                    block_depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                out.push(if c == '\n' { '\n' } else { ' ' });
+                i += 1;
+                continue;
+            }
+            if in_str || in_char {
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if in_str && c == '"' {
+                    in_str = false;
+                } else if in_char && c == '\'' {
+                    in_char = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == '/' && next == Some('/') {
+                in_line = true;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                block_depth = 1;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+            } else if c == '\'' && bytes.get(i + 2) == Some(&b'\'') {
+                // Only the three-byte char form, so a lifetime is left alone.
+                in_char = true;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn the_comment_stripper_keeps_strings_and_drops_prose() {
+        let src = concat!(
+            "let a = \"keeps // this\";\n",
+            "// drops {:#} this\n",
+            "let b = \"keeps /* this */ too\";\n",
+            "/* drops\n   {e:#} across lines */\n",
+            "let c = '\"';\n",
+            "let d = \"tail {x:#}\";\n",
+        );
+        let out = strip_comments(src);
+        assert!(
+            out.contains("keeps // this"),
+            "string content was stripped: {out}"
+        );
+        assert!(
+            out.contains("keeps /* this */ too"),
+            "string content was stripped: {out}"
+        );
+        assert!(
+            out.contains("tail {x:#}"),
+            "a real hazard in a string was stripped: {out}"
+        );
+        assert!(
+            !out.contains("drops {:#} this"),
+            "line comment survived: {out}"
+        );
+        assert!(!out.contains("{e:#}"), "block comment survived: {out}");
+        assert_eq!(
+            out.matches('\n').count(),
+            src.matches('\n').count(),
+            "line count changed, so reported line numbers would be wrong"
+        );
+    }
+
     /// The PREDICATE, against synthetic strings rather than today's corpus.
     ///
     /// Without this, the only exercise the match gets is the real file, so the day
