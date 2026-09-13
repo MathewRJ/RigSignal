@@ -76,14 +76,30 @@ def strip_trailer_addresses(message: str, keys: list[str]) -> str:
     prose does not get an exemption.
     """
     paragraphs = message.split("\n\n")
-    if not paragraphs:
-        return message
+    # Trailing blank paragraphs: git preserves a message ending "...\n\n", which
+    # makes paragraphs[-1] the EMPTY string and leaves the real trailer one
+    # element back, un-exempted. Found in review; it produced spurious findings
+    # on a legitimate commit.
+    last = len(paragraphs) - 1
+    while last > 0 and not paragraphs[last].strip():
+        last -= 1
+
     key_alternation = "|".join(re.escape(key) for key in keys)
+    # The capture is an EMAIL GRAMMAR, not "anything between angle brackets".
+    #
+    # A review found the critical hole here: with `[^<>\n]+` the exemption blanked
+    # whatever was placed inside the brackets, so
+    #   Co-Authored-By: Name <a@b.com -- ssh admin@10.0.0.5 mac 0a:1b:2c:3d:4e:5f>
+    # scanned completely clean. The accommodation the project's mandated trailer
+    # requires had become a way to smuggle anything past every rule. Anything that
+    # is not an address now falls through to normal scanning.
     trailer = re.compile(
-        rf"^(\s*(?:{key_alternation})\s*:\s*[^<>\n]*<)[^<>\n]+(>\s*)$",
+        rf"^([ \t]*(?:{key_alternation})[ \t]*:[ \t]*[^<>\n]*<)"
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+        r"(>[ \t]*)$",
         re.IGNORECASE | re.MULTILINE,
     )
-    paragraphs[-1] = trailer.sub(r"\1\2", paragraphs[-1])
+    paragraphs[last] = trailer.sub(r"\1\2", paragraphs[last])
     return "\n\n".join(paragraphs)
 
 
@@ -105,11 +121,18 @@ def scan(message: str, source: str, rules: dict) -> list[Finding]:
         cleaned, rules["documentation_addresses"]["prefixes"]
     )
 
+    glob_rules = set(rules.get("glob_exemption", {}).get("applies_to", []))
+
     findings: list[Finding] = []
     for rule in rules["rules"]:
         # finditer, not search: report every occurrence. One message with four
         # private addresses should cost one fix, not four red runs.
         for match in rule["compiled"].finditer(cleaned):
+            if rule["id"] in glob_rules and _token_has_glob(cleaned, match.start()):
+                # A discovery-path TEMPLATE, not a location. The glob sits AFTER
+                # the matched span, so this looks at the surrounding token rather
+                # than the match -- checking the match alone would never see it.
+                continue
             line_no = cleaned.count("\n", 0, match.start()) + 1
             findings.append(
                 Finding(
@@ -150,6 +173,17 @@ def _apply_precedence(findings: list[Finding], rules: dict) -> list[Finding]:
         if not suppressed:
             kept.append(finding)
     return kept
+
+
+def _token_has_glob(text: str, index: int) -> bool:
+    """Does the whitespace-delimited token containing `index` hold a `*`?"""
+    start = index
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    end = index
+    while end < len(text) and not text[end].isspace():
+        end += 1
+    return "*" in text[start:end]
 
 
 def commit_messages(base: str, head: str) -> list[tuple[str, str]]:
@@ -222,6 +256,20 @@ SELFTEST_CASES = [
     ("cc: ran on 192.168.1.1", "private-ipv4"),
     # A well-formed trailer key, but NOT in the final paragraph, so not a trailer.
     ("Co-Authored-By: N <n@10.0.0.5>\n\nbody text", "private-ipv4"),
+    # THE CRITICAL CASE a review found: the trailer exemption blanked whatever sat
+    # inside the brackets, so a well-formed key was a way to smuggle anything past
+    # every rule. The capture is an email grammar now, and this must fire.
+    (
+        "subject\n\nCo-Authored-By: N <a@b.com -- ssh admin@10.0.0.5>",
+        "private-ipv4",
+    ),
+    ("subject\n\nCo-Authored-By: N <a@b.com mac 0a:1b:2c:3d:4e:5f>", "mac-address"),
+    # Notations the first rule set missed. The dash form is the Windows getmac
+    # default, so it is the likely accidental paste rather than an attack.
+    ("nic 0a-1b-2c-3d-4e-5f flapped", "mac-address"),
+    ("nic 0a1b.2c3d.4e5f flapped", "mac-address"),
+    ("built in ${HOME}/coding/thing", "tilde-checkout-path"),
+    ("moved /home//someone/project/file.rs", "absolute-home-path"),
 ]
 
 SELFTEST_CLEAN = [
@@ -229,6 +277,12 @@ SELFTEST_CLEAN = [
     "Co-Authored-By: Someone <someone@example.com>\n",
     "docs: cite the reserved example address 192.0.2.254 in a doc comment\n",
     "test: cover the 2001:db8::1 documentation prefix\n",
+    # A glob is a discovery TEMPLATE and names nothing. Real false positive on a
+    # real commit, found by running against history rather than fixtures.
+    "fix: search ~/elastic/elastic-agent-*/ for the binary\n",
+    # A message ending in a blank line leaves paragraphs[-1] empty; the real
+    # trailer is one element back and must still be exempted.
+    "fix: something\n\nCo-Authored-By: Someone <someone@example.com>\n\n",
 ]
 
 

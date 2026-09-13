@@ -53,14 +53,14 @@
     },
     {
       "id": "absolute-home-path",
-      "pattern": "(?<![A-Za-z0-9_./~-])(?:/home/[A-Za-z0-9._-]+/|/root/)",
+      "pattern": "(?<![A-Za-z0-9_./~-])(?:/home/+[A-Za-z0-9._-]+/|/root/)",
       "why": "An absolute home path names a local account and the layout of a machine that is not this repository.",
       "severity": "error"
     },
     {
       "id": "tilde-checkout-path",
-      "pattern": "(?:~|\\$HOME)/(?!\\.)[A-Za-z0-9_-][A-Za-z0-9._-]*/",
-      "why": "A personal checkout path describes a working environment rather than the code; refer to paths relative to the repository root. Dotfile-rooted paths such as ~/.local or ~/.config are deliberately NOT matched: they are standard locations that name neither a user nor a machine, and an earlier revision of this rule produced a false positive on ~/.local/bin in a real tag message.",
+      "pattern": "(?:~|\\$HOME|\\$\\{HOME\\})/(?!\\.)[A-Za-z0-9_-][A-Za-z0-9._-]*/",
+      "why": "A personal checkout path describes a working environment rather than the code; refer to paths relative to the repository root. Dotfile-rooted paths such as ~/.local or ~/.config are deliberately NOT matched: they are standard locations that name neither a user nor a machine, and an earlier revision of this rule produced a false positive on ~/.local/bin in a real tag message. The braced ${HOME} form is matched too. Spans containing a literal '*' are exempted by the glob rule below: a discovery-path TEMPLATE names neither a user nor a machine, and a real leaked path does not contain a glob.",
       "severity": "error"
     },
     {
@@ -77,8 +77,8 @@
     },
     {
       "id": "mac-address",
-      "pattern": "(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:])",
-      "why": "A MAC address identifies one physical interface and is stable for the life of the hardware.",
+      "pattern": "(?<![0-9A-Fa-f:.-])(?:(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}|(?:[0-9A-Fa-f]{4}\\.){2}[0-9A-Fa-f]{4})(?![0-9A-Fa-f:.-])",
+      "why": "A MAC address identifies one physical interface and is stable for the life of the hardware. Colon, dash and Cisco dotted-triplet notations are all matched: the dash form is the Windows getmac default, so it is the likely accidental paste rather than an adversarial one.",
       "severity": "error"
     },
     {
@@ -96,5 +96,12 @@
         "session-id"
       ]
     }
+  },
+  "glob_exemption": {
+    "why": "A path containing a literal '*' is a discovery TEMPLATE, not a location. It names neither a user nor a machine. Found in review as a false positive on a real commit referencing an installation-directory glob.",
+    "applies_to": [
+      "tilde-checkout-path",
+      "absolute-home-path"
+    ]
   }
 }

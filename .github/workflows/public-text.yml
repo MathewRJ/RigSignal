@@ -133,18 +133,37 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${BASE:-}" ]; then
+            # A pull_request always carries both endpoints in its metadata.
             base="$BASE"
           else
-            # A push: lint what this push added. before is all-zero for a new
-            # ref, in which case fall back to the merge base with main so a new
-            # branch does not lint the entire published history.
+            # A push: lint what this push added. `before` is all-zero for a new
+            # ref, and absent entirely for workflow_dispatch.
             before="${{ github.event.before }}"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
-              base="$(git merge-base origin/main HEAD || git rev-list --max-parents=0 HEAD | tail -1)"
+              base="$(git merge-base origin/main HEAD || true)"
             else
               base="$before"
             fi
           fi
+
+          # FAIL LOUD ON AN UNDETERMINABLE RANGE rather than compute a vacuous one.
+          #
+          # A review found this: on workflow_dispatch there is no `before`, and
+          # actions/checkout leaves origin/main pointing at HEAD itself, so the
+          # fallback returned HEAD and the range was EMPTY. The job then printed
+          # "scanned 0 message(s) / clean" and exited 0 while HEAD's own message
+          # carried a private address. A gate that cannot tell what is new must
+          # say so, not pass.
+          if [ -z "${base:-}" ] || [ "$base" = "$HEAD" ]; then
+            echo "public_text_lint: cannot determine which commits are new."
+            echo "  base=${base:-<empty>} head=$HEAD event=${{ github.event_name }}"
+            echo "An empty range would scan nothing and report clean, which is"
+            echo "indistinguishable from a pass. Refusing instead."
+            echo "Re-run against a branch, or pass an explicit range locally:"
+            echo "  python3 .github/lint/public_text_lint.py --base <sha> --head <sha>"
+            exit 1
+          fi
+
           echo "range: $base..${HEAD}"
           python3 .github/lint/public_text_lint.py --base "$base" --head "$HEAD"
 
