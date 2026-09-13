@@ -2080,7 +2080,11 @@ mod tests {
         // THIS IS A WAIVER LIST, NOT A PROOF, and the name says so because the
         // previous revision called it STATIC_OUTERMOST_CONTEXT and asserted that
         // every entry's outermost layer was a static literal. A non-author review
-        // falsified that for ALL SEVEN entries by two distinct routes.
+        // falsified that for EVERY entry in the list below, by two distinct routes.
+        // (The phrase used to say "all seven". The list was seven entries when that
+        // was written and is eight now, so the number is deliberately gone rather
+        // than bumped: a count restated in prose beside a compiler-checked array
+        // goes stale silently, and this one did.)
         //
         // ROUTE ONE IS NOW CLOSED: `shipper::ping`, `ship_documents` and
         // `trigger_transform_sync` each called `build_client(config)?` with a bare
