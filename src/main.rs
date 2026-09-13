@@ -2068,6 +2068,53 @@ mod tests {
         out
     }
 
+    /// If a raw string starts at `i` (`r"`, `r#"`, `r##"` ...), the index just
+    /// past its closing delimiter.
+    ///
+    /// Raw strings matter here because a backslash inside one is NOT an escape.
+    /// A review found live instances: `config.rs` holds `r#"..."#` TOML fixtures,
+    /// and treating them as ordinary strings desynchronises the quote tracker.
+    /// They are currently benign only by coincidence -- every embedded string
+    /// happens to contribute an even quote count -- which is not a property
+    /// anyone maintains on purpose.
+    fn raw_string_end(src: &str, i: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        if bytes.get(i) != Some(&b'r') {
+            return None;
+        }
+        let mut hashes = 0usize;
+        let mut j = i + 1;
+        while bytes.get(j) == Some(&b'#') {
+            hashes += 1;
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'"') {
+            return None;
+        }
+        // `r` must not be the tail of an identifier (`foo_r"..."` is not a raw
+        // string, and `br"..."` is handled by the caller stepping onto the `r`).
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() && prev != b'b' || prev == b'_' {
+                return None;
+            }
+        }
+        let mut k = j + 1;
+        while k < bytes.len() {
+            if bytes[k] == b'"' {
+                let mut closing = 0usize;
+                while closing < hashes && bytes.get(k + 1 + closing) == Some(&b'#') {
+                    closing += 1;
+                }
+                if closing == hashes {
+                    return Some(k + 1 + hashes);
+                }
+            }
+            k += 1;
+        }
+        None
+    }
+
     /// Index of the `}` closing the `{` at `open`, honouring strings, char
     /// literals and comments so a brace inside any of them cannot end the block.
     fn matching_brace(src: &str, open: usize) -> Option<usize> {
@@ -2075,7 +2122,8 @@ mod tests {
         let mut depth = 0usize;
         let mut i = open;
         let (mut in_str, mut in_char, mut escaped) = (false, false, false);
-        let (mut in_line, mut in_block) = (false, false);
+        let mut in_line = false;
+        let mut block_depth = 0usize;
         while i < bytes.len() {
             let c = bytes[i] as char;
             let next = bytes.get(i + 1).map(|b| *b as char);
@@ -2086,9 +2134,18 @@ mod tests {
                 i += 1;
                 continue;
             }
-            if in_block {
+            if block_depth > 0 {
+                // DEPTH, not a flag. Rust block comments nest, and the sibling
+                // `strip_comments` already counted depth -- this function was
+                // written with a bool and regressed against a correct pattern
+                // sitting a few hundred lines away in the same file.
+                if c == '/' && next == Some('*') {
+                    block_depth += 1;
+                    i += 2;
+                    continue;
+                }
                 if c == '*' && next == Some('/') {
-                    in_block = false;
+                    block_depth -= 1;
                     i += 2;
                     continue;
                 }
@@ -2115,8 +2172,12 @@ mod tests {
                     continue;
                 }
                 '/' if next == Some('*') => {
-                    in_block = true;
+                    block_depth = 1;
                     i += 2;
+                    continue;
+                }
+                'r' | 'b' if raw_string_end(src, i).is_some() => {
+                    i = raw_string_end(src, i).expect("checked");
                     continue;
                 }
                 '"' => in_str = true,
@@ -2230,12 +2291,33 @@ mod tests {
         // the file count and the byte floor comfortably. An aggregate assertion
         // bounds total collapse and nothing finer, which is less than it looks.
         //
-        // Each anchor is a production symbol that sits DEEP in its file, past the
-        // point where the previous implementation stopped reading. If the region
-        // logic regresses, these vanish and say which file went dark.
+        // Each anchor is a production symbol deep in its file. If the region logic
+        // regresses, the anchor vanishes and names the file that went dark.
+        //
+        // WHAT EACH ONE ACTUALLY DISCRIMINATES, measured rather than assumed,
+        // because the first attempt at this list contained an anchor that proved
+        // nothing and I did not notice:
+        //   shipper.rs    catches the rejected cut-at-first-marker (that file was
+        //                 reduced to 0.7% by it)
+        //   session.rs    likewise -- but ONLY with a symbol past the test module.
+        //                 `Lutris` was the first choice and appears in a doc
+        //                 comment on line 4, so the BROKEN region contained it too
+        //                 and the anchor was satisfied by both versions.
+        //   handshake.rs  does NOT discriminate against that particular
+        //                 regression, because the old cut happened to be correct
+        //                 for this file. It is forward-looking: it guards against
+        //                 a FUTURE change that shortens this file's region.
+        //
+        // An anchor satisfied by both the fixed and the broken version is not a
+        // weak test, it is not a test.
         for (file, anchor) in [
             ("shipper.rs", "fn build_client"),
-            ("session.rs", "Lutris"),
+            // `Lutris` was the first choice and it was BLIND: it appears in a
+            // doc comment at session.rs line 4, so the REJECTED implementation's
+            // output contained it too. An anchor that both the fixed and the
+            // broken version satisfy tests nothing. This symbol exists only past
+            // the test module, which is the region that was being lost.
+            ("session.rs", "LutrisGameConfig"),
             ("handshake.rs", "fn endpoint_origin"),
         ] {
             let path = root.join(file);
@@ -2422,12 +2504,74 @@ mod tests {
         );
         assert!(region.contains("KEEP_THREE"), "tail dropped: {region}");
 
-        // Line numbers must survive, or every reported line is wrong.
-        assert_eq!(
-            production_region(shape_one).matches('\n').count(),
-            shape_one.matches('\n').count(),
-            "line count changed, so reported line numbers would be wrong"
+        // A BLOCK COMMENT containing a brace, and a NESTED one. `matching_brace`
+        // tracked block comments with a bool until a review pointed out that Rust
+        // nests them and that its sibling `strip_comments` already counted depth.
+        let blocks = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    /* } */\n",
+            "    /* outer /* inner } */ still outer } */\n",
+            "    fn a() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_four() { let _ = \"KEEP_FOUR\"; }\n",
         );
+        let region = production_region(blocks);
+        assert!(
+            !region.contains("DROP_ME"),
+            "block comments ended the block early: {region}"
+        );
+        assert!(region.contains("KEEP_FOUR"), "tail dropped: {region}");
+
+        // A CHAR LITERAL holding a brace.
+        let chars = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn a() { let _ = '}'; let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_five() { let _ = \"KEEP_FIVE\"; }\n",
+        );
+        let region = production_region(chars);
+        assert!(
+            !region.contains("DROP_ME"),
+            "a char literal ended the block early: {region}"
+        );
+        assert!(region.contains("KEEP_FIVE"), "tail dropped: {region}");
+
+        // RAW STRINGS. A backslash inside one is not an escape, and the corpus
+        // really contains `r#"..."#` fixtures -- config.rs holds several.
+        let raws = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    const A: &str = r\"trailing backslash \\\";\n",
+            "    const B: &str = r#\"has \"quotes\" and a } brace\"#;\n",
+            "    fn a() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_six() { let _ = \"KEEP_SIX\"; }\n",
+        );
+        let region = production_region(raws);
+        assert!(
+            !region.contains("DROP_ME"),
+            "a raw string desynced the scan: {region}"
+        );
+        assert!(region.contains("KEEP_SIX"), "tail dropped: {region}");
+
+        // Line numbers must survive for EVERY fixture, not just the first --
+        // asserting it once was flagged in review as covering less than it looked.
+        for (name, fixture) in [
+            ("shape_one", shape_one),
+            ("shape_two", shape_two),
+            ("tricky", tricky),
+            ("blocks", blocks),
+            ("chars", chars),
+            ("raws", raws),
+        ] {
+            assert_eq!(
+                production_region(fixture).matches('\n').count(),
+                fixture.matches('\n').count(),
+                "{name}: line count changed, so reported line numbers would be wrong"
+            );
+        }
     }
 
     #[test]
