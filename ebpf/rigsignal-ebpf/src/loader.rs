@@ -63,13 +63,27 @@ pub fn load_probes(
                 active.push(probe);
             }
             Err(e) => {
-                // Plain render: the OUTERMOST context only. The probes build
-                // deep context chains here ("attaching X kprobe on Y" over an
-                // aya error), so unlike the Windows PDH sites this one really
-                // does lose detail -- the aya cause underneath is dropped. Taken
-                // deliberately: the alternate render walks every cause verbatim,
-                // and an error chain is not a safe thing to print by default
-                // just because today's causes happen to be benign.
+                // Plain render: the OUTERMOST context only. Unlike the Windows
+                // PDH sites, whose errors are a single anyhow layer and so lose
+                // nothing, this one really does drop a cause -- and a non-author
+                // review corrected my first description of WHICH cause, which is
+                // worth recording because it is the more useful half.
+                //
+                // It is not only an aya error underneath. The attach path wraps
+                // `io::Error` (reading a tracepoint format file) and this crate's
+                // own `FormatError`. The worst case is the latter: a format
+                // mismatch renders as `parsing <path>` here, while the cause it
+                // hides is the actual diagnosis, e.g. "field 'id' has size 4,
+                // expected 8". The outermost layer names the file; the dropped
+                // cause names the problem.
+                //
+                // Taken deliberately anyway: the alternate render walks every
+                // cause verbatim, and an error chain is not a safe thing to print
+                // by default merely because today's causes happen to be benign --
+                // that reasoning is what failed for the ES ping, where reqwest
+                // embedded the full request URL in its own error. If this loss
+                // proves to bite, the fix is a root-cause render (outermost plus
+                // deepest, skipping the middle), not the full chain.
                 warn!("failed to attach probe '{}': {e}", probe.name());
                 skipped += 1;
             }
