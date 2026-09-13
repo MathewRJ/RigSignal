@@ -1977,6 +1977,45 @@ mod tests {
         );
     }
 
+    /// The PREDICATE, against synthetic strings rather than today's corpus.
+    ///
+    /// Without this, the only exercise the match gets is the real file, so the day
+    /// the corpus stops containing a form is the day that form silently stops
+    /// being tested. The negative cases matter as much as the positive ones: this
+    /// predicate is a substring match and is much broader than the whole
+    /// placeholders it replaced.
+    #[test]
+    fn the_alternate_render_predicate_matches_every_spelling_and_no_width_spec() {
+        for caught in [
+            "\"x: {:#}\", e",
+            "\"x: {e:#}\"",
+            "\"x: {0:#}\", e",
+            "\"x: {name:#}\"",
+            "\"x: {:?}\", e",
+            "\"x: {e:?}\"",
+            "\"x: {:#?}\", e",
+            "\"x: {e:#?}\"",
+        ] {
+            assert!(
+                alternate_or_debug_render(caught).is_some(),
+                "not caught: {caught}"
+            );
+        }
+        for allowed in [
+            "\"plain {}\", e",
+            "\"width {:>8}\", n",
+            "\"precision {:.3}\", f",
+            "\"named {name}\"",
+            "\"hex {:#x}\", n",
+            "%error, \"structured field\"",
+        ] {
+            assert!(
+                alternate_or_debug_render(allowed).is_none(),
+                "false positive: {allowed}"
+            );
+        }
+    }
+
     /// The rejected design must not come back, and partial wiring must not pass.
     ///
     /// A non-author review demonstrated both gaps by mutation: routing only ONE
@@ -2142,9 +2181,8 @@ mod tests {
         // The three closing forms are listed separately because none contains
         // another as a substring.
         for (line_no, body) in &sites {
-            for spec in [":#}", ":?}", ":#?}"] {
-                assert!(
-                    !body.contains(spec),
+            if let Some(spec) = alternate_or_debug_render(body) {
+                panic!(
                     "line {line_no} uses an alternate/debug render ending `{spec}`, \
                      which prints every cause verbatim. This matches the inline \
                      capture form (`{{e:#}}`) as well as the bare one (`{{:#}}`): \
@@ -2198,6 +2236,23 @@ mod tests {
     /// fail-OPEN, and a `'('` char literal was measured doing exactly that --
     /// inflating the depth, running to EOF, and dropping the site while the total
     /// stayed inside a minimum-count floor.
+    /// The alternate or debug render specs, matched by their CLOSING form so the
+    /// inline-capture spelling is covered. Returns the spec that matched.
+    ///
+    /// WHAT THIS DOES NOT CATCH, stated because a guard that hides its edges
+    /// invites someone to trust it past them: a fill or align character before the
+    /// flag (`{e:>#}`) defeats it, as it defeated the whole-placeholder list this
+    /// replaced. That form appears nowhere in the corpus and closing it needs a
+    /// real parse of the format spec rather than a substring, so it is recorded
+    /// rather than half-handled. Tracing's `?field` Debug shorthand is a different
+    /// mechanism again and is not a format spec at all; there are no such sites in
+    /// what this guard covers.
+    fn alternate_or_debug_render(body: &str) -> Option<&'static str> {
+        [":#}", ":?}", ":#?}"]
+            .into_iter()
+            .find(|spec| body.contains(spec))
+    }
+
     fn warning_call_sites(src: &str) -> Vec<(usize, String)> {
         let bytes = src.as_bytes();
         let mut out = Vec::new();
