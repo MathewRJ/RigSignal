@@ -63,28 +63,30 @@ pub fn load_probes(
                 active.push(probe);
             }
             Err(e) => {
-                // Plain render: the OUTERMOST context only. Unlike the Windows
-                // PDH sites, whose errors are a single anyhow layer and so lose
-                // nothing, this one really does drop a cause -- and a non-author
-                // review corrected my first description of WHICH cause, which is
-                // worth recording because it is the more useful half.
+                // Root-cause render: the outermost context and the DEEPEST
+                // cause, with the middle of the chain dropped.
                 //
-                // It is not only an aya error underneath. The attach path wraps
-                // `io::Error` (reading a tracepoint format file) and this crate's
-                // own `FormatError`. The worst case is the latter: a format
-                // mismatch renders as `parsing <path>` here, while the cause it
-                // hides is the actual diagnosis, e.g. "field 'id' has size 4,
-                // expected 8". The outermost layer names the file; the dropped
-                // cause names the problem.
+                // Not the plain render, and not the alternate one. The six
+                // Windows PDH sites in this change are plain because their
+                // errors are a single anyhow layer, so the two renders are
+                // identical text there. This site is different: a review showed
+                // the plain render keeps the ADDRESS and drops the ANSWER. A
+                // tracepoint format mismatch renders as `parsing <path>` while
+                // the cause it hides is the diagnosis itself -- "field 'id' has
+                // size 4, expected 8". The wrapped causes here are `io::Error`
+                // and this crate's `FormatError`, not only aya errors.
                 //
-                // Taken deliberately anyway: the alternate render walks every
-                // cause verbatim, and an error chain is not a safe thing to print
-                // by default merely because today's causes happen to be benign --
-                // that reasoning is what failed for the ES ping, where reqwest
-                // embedded the full request URL in its own error. If this loss
-                // proves to bite, the fix is a root-cause render (outermost plus
-                // deepest, skipping the middle), not the full chain.
-                warn!("failed to attach probe '{}': {e}", probe.name());
+                // And not the alternate render `{e:#}`, which walks every cause
+                // verbatim. An error chain is not safe to print by default just
+                // because today's causes are benign -- that reasoning is what
+                // failed for the ES ping, where reqwest embedded the full
+                // request URL in its own error. The two ends of a chain are what
+                // an operator reads; the middle is where request detail lives.
+                warn!(
+                    "failed to attach probe '{}': {}",
+                    probe.name(),
+                    attach_failure_reason(&e)
+                );
                 skipped += 1;
             }
         }
@@ -147,4 +149,65 @@ fn check_btf() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Render an error as `<outermost>: <root cause>`, dropping the middle.
+///
+/// The outermost layer says what we were doing; the deepest says why it failed.
+/// The layers between are where request and path detail accumulate, which is the
+/// part that must not reach a log by default.
+///
+/// This is a REDUCTION, not a scrub: nothing is pattern-matched out of a string.
+/// If a cause type ever puts sensitive detail in its ROOT, this would not stop it.
+fn attach_failure_reason(error: &anyhow::Error) -> String {
+    let outermost = error.to_string();
+    match error.chain().skip(1).last() {
+        Some(root) => {
+            let root = root.to_string();
+            if root == outermost {
+                outermost
+            } else {
+                format!("{outermost}: {root}")
+            }
+        }
+        None => outermost,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attach_failure_reason;
+    use anyhow::{anyhow, Context};
+
+    #[test]
+    fn keeps_the_diagnosis_and_drops_the_middle() {
+        // The exact shape a non-author review produced as the counterexample to
+        // the plain render: the outermost layer names the FILE, a middle layer
+        // names the operation, and the root names the actual problem.
+        let error = Err::<(), _>(anyhow!("field 'id' has size 4, expected 8"))
+            .context("parsing /sys/kernel/tracing/events/gpu_scheduler/format")
+            .context("attaching drm_sched_job tracepoint")
+            .unwrap_err();
+
+        let rendered = attach_failure_reason(&error);
+
+        assert!(
+            rendered.contains("field 'id' has size 4, expected 8"),
+            "the diagnosis was dropped: {rendered}"
+        );
+        assert!(
+            rendered.starts_with("attaching drm_sched_job tracepoint"),
+            "the outermost context was dropped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/sys/kernel/tracing"),
+            "a middle layer survived, which is what this render exists to drop: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_single_layer_error_is_not_duplicated() {
+        let error = anyhow!("PDH error code: 0x800007D5");
+        assert_eq!(attach_failure_reason(&error), "PDH error code: 0x800007D5");
+    }
 }
