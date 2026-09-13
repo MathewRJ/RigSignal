@@ -63,8 +63,14 @@ pub fn load_probes(
                 active.push(probe);
             }
             Err(e) => {
-                // {e:#} prints the full anyhow error chain (cause by cause).
-                warn!("failed to attach probe '{}': {e:#}", probe.name());
+                // Plain render: the OUTERMOST context only. The probes build
+                // deep context chains here ("attaching X kprobe on Y" over an
+                // aya error), so unlike the Windows PDH sites this one really
+                // does lose detail -- the aya cause underneath is dropped. Taken
+                // deliberately: the alternate render walks every cause verbatim,
+                // and an error chain is not a safe thing to print by default
+                // just because today's causes happen to be benign.
+                warn!("failed to attach probe '{}': {e}", probe.name());
                 skipped += 1;
             }
         }

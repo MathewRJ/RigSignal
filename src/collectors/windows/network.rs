@@ -41,7 +41,7 @@ impl NetworkCollector {
     fn init_pdh(&mut self) {
         match self.try_init_pdh() {
             Ok(()) => self.initialized = true,
-            Err(e) => tracing::warn!("NetworkCollector PDH init failed: {e:#}"),
+            Err(e) => tracing::warn!("NetworkCollector PDH init failed: {e}"),
         }
     }
 
@@ -75,7 +75,7 @@ impl Collector for NetworkCollector {
             None => return Ok(None),
         };
         if let Err(e) = query.collect() {
-            tracing::warn!("NetworkCollector PDH collect failed: {e:#}");
+            tracing::warn!("NetworkCollector PDH collect failed: {e}");
             return Ok(None);
         }
 
