@@ -2011,19 +2011,128 @@ mod tests {
         out
     }
 
-    /// Everything before the TOP-LEVEL `#[cfg(test)]`, or the whole file.
+    /// The file with its `#[cfg(test)] mod ... { ... }` blocks removed, and
+    /// nothing else removed.
     ///
-    /// Anchored to a line start so an INDENTED `#[cfg(test)]` cannot cut the file
-    /// early, and so it holds under CRLF -- both traps are recorded on the guard
-    /// above, one of which only CI on Windows could see.
-    fn production_region(src: &str) -> &str {
-        match src
-            .match_indices("#[cfg(test)]")
-            .find(|(i, _)| *i == 0 || src.as_bytes()[i - 1] == b'\n')
-        {
-            Some((i, _)) => &src[..i],
-            None => src,
+    /// THE OBVIOUS IMPLEMENTATION IS WRONG AND WAS REJECTED IN REVIEW. Cutting the
+    /// file at the first line-anchored `#[cfg(test)]` assumes that marker is the
+    /// start of the test module and that nothing production follows it. Both
+    /// halves are false in this crate, measured:
+    ///
+    ///   * `shipper.rs` opens with a `#[cfg(test)] use ...;` -- an idiomatic
+    ///     test-only import -- at line 14, so the cut landed there and scanned
+    ///     461 of 67,933 bytes. 99.3% of the ES bulk shipper was excluded from a
+    ///     guard whose whole subject is what that file logs.
+    ///   * `session.rs` places production code AFTER its test module by design,
+    ///     with an `#[allow(clippy::items_after_test_module)]` and a comment
+    ///     saying so. 60% of it was excluded, including eight warning sites.
+    ///
+    /// So remove the test MODULES by brace matching and keep everything else. A
+    /// `#[cfg(test)]` on a single item has no block and is left alone; it cannot
+    /// carry a hazard, and cutting at it costs the rest of the file.
+    ///
+    /// Removed spans are replaced by newlines rather than deleted, so reported
+    /// line numbers still refer to the real file.
+    fn production_region(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut cursor = 0usize;
+        for (marker, _) in src.match_indices("#[cfg(test)]") {
+            if marker < cursor {
+                continue;
+            }
+            if marker != 0 && bytes[marker - 1] != b'\n' {
+                continue; // indented: not a top-level item
+            }
+            // Only a MODULE is removed. Anything else keeps its place.
+            let after = &src[marker + "#[cfg(test)]".len()..];
+            let trimmed = after.trim_start();
+            if !trimmed.starts_with("mod ") {
+                continue;
+            }
+            let Some(open_rel) = after.find('{') else {
+                continue;
+            };
+            let open = marker + "#[cfg(test)]".len() + open_rel;
+            let Some(end) = matching_brace(src, open) else {
+                continue;
+            };
+            out.push_str(&src[cursor..marker]);
+            // Preserve line count so line numbers stay true to the file.
+            for _ in src[marker..=end].bytes().filter(|b| *b == b'\n') {
+                out.push('\n');
+            }
+            cursor = end + 1;
         }
+        out.push_str(&src[cursor..]);
+        out
+    }
+
+    /// Index of the `}` closing the `{` at `open`, honouring strings, char
+    /// literals and comments so a brace inside any of them cannot end the block.
+    fn matching_brace(src: &str, open: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut i = open;
+        let (mut in_str, mut in_char, mut escaped) = (false, false, false);
+        let (mut in_line, mut in_block) = (false, false);
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            let next = bytes.get(i + 1).map(|b| *b as char);
+            if in_line {
+                if c == '\n' {
+                    in_line = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_block {
+                if c == '*' && next == Some('/') {
+                    in_block = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if in_str || in_char {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if in_str && c == '"' {
+                    in_str = false;
+                } else if in_char && c == '\'' {
+                    in_char = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '/' if next == Some('/') => {
+                    in_line = true;
+                    i += 2;
+                    continue;
+                }
+                '/' if next == Some('*') => {
+                    in_block = true;
+                    i += 2;
+                    continue;
+                }
+                '"' => in_str = true,
+                '\'' if bytes.get(i + 2) == Some(&b'\'') => in_char = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
     }
 
     /// TREE-WIDE: no production source anywhere in this crate may render an error
@@ -2097,7 +2206,7 @@ mod tests {
         for path in &files {
             let raw = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            let region = strip_comments(production_region(&raw));
+            let region = strip_comments(&production_region(&raw));
             scanned_bytes += region.len();
             for (index, line) in region.lines().enumerate() {
                 for spec in ALTERNATE_SPECS {
@@ -2114,6 +2223,35 @@ mod tests {
             "only {scanned_bytes} bytes of production source were scanned; the cut \
              or the stripper has eaten the corpus"
         );
+
+        // PER-FILE ANCHORS, because the aggregate floor above CANNOT see one file
+        // collapsing. A review demonstrated exactly that: the corpus is ~900 KB,
+        // so losing 99% of the ES shipper AND 60% of session.rs still cleared both
+        // the file count and the byte floor comfortably. An aggregate assertion
+        // bounds total collapse and nothing finer, which is less than it looks.
+        //
+        // Each anchor is a production symbol that sits DEEP in its file, past the
+        // point where the previous implementation stopped reading. If the region
+        // logic regresses, these vanish and say which file went dark.
+        for (file, anchor) in [
+            ("shipper.rs", "fn build_client"),
+            ("session.rs", "Lutris"),
+            ("handshake.rs", "fn endpoint_origin"),
+        ] {
+            let path = root.join(file);
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            assert!(
+                raw.contains(anchor),
+                "anchor `{anchor}` is no longer in {file}; update the anchor rather \
+                 than deleting it, or this check silently stops checking"
+            );
+            assert!(
+                production_region(&raw).contains(anchor),
+                "{file} is being scanned only up to some point BEFORE `{anchor}`, so \
+                 the tail of that file is unguarded while this test still passes"
+            );
+        }
         assert!(
             findings.is_empty(),
             "production source renders an error with the alternate form, which \
@@ -2211,6 +2349,85 @@ mod tests {
             i += 1;
         }
         out
+    }
+
+    /// `production_region` against the two real shapes that broke its predecessor.
+    ///
+    /// Its first implementation cut the file at the first line-anchored
+    /// `#[cfg(test)]`, which is wrong twice over in this crate, and neither case
+    /// was hypothetical -- a review measured both. Only `strip_comments` had a
+    /// test; this function did not, and that is why the defect shipped to review.
+    #[test]
+    fn production_region_removes_test_modules_and_nothing_else() {
+        // SHAPE 1: a `#[cfg(test)]` single item BEFORE the real test module. The
+        // old cut landed on the import and dropped the rest of the file --
+        // measured at 99.3% of the ES shipper.
+        let shape_one = concat!(
+            "use std::io;\n",
+            "#[cfg(test)]\n",
+            "use std::collections::HashSet;\n",
+            "fn production_one() { let _ = \"KEEP_ONE\"; }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn helper() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+        );
+        let region = production_region(shape_one);
+        assert!(
+            region.contains("KEEP_ONE"),
+            "production code dropped: {region}"
+        );
+        assert!(
+            region.contains("HashSet"),
+            "a cfg(test) single item has no block and must not cut the file: {region}"
+        );
+        assert!(
+            !region.contains("DROP_ME"),
+            "test module survived: {region}"
+        );
+
+        // SHAPE 2: production code AFTER the test module. session.rs does this
+        // deliberately and says so in an allow attribute.
+        let shape_two = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn helper() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_two() { let _ = \"KEEP_TWO\"; }\n",
+        );
+        let region = production_region(shape_two);
+        assert!(
+            region.contains("KEEP_TWO"),
+            "code after the test module was dropped: {region}"
+        );
+        assert!(
+            !region.contains("DROP_ME"),
+            "test module survived: {region}"
+        );
+
+        // A brace inside a string or a comment must not end the block early.
+        let tricky = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn a() { let _ = \"}\"; }\n",
+            "    // }\n",
+            "    fn b() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_three() { let _ = \"KEEP_THREE\"; }\n",
+        );
+        let region = production_region(tricky);
+        assert!(
+            !region.contains("DROP_ME"),
+            "brace-matching ended early: {region}"
+        );
+        assert!(region.contains("KEEP_THREE"), "tail dropped: {region}");
+
+        // Line numbers must survive, or every reported line is wrong.
+        assert_eq!(
+            production_region(shape_one).matches('\n').count(),
+            shape_one.matches('\n').count(),
+            "line count changed, so reported line numbers would be wrong"
+        );
     }
 
     #[test]
