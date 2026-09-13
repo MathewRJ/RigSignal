@@ -92,7 +92,39 @@ jobs:
             echo "ARMED CHECK FAILED: a clean message was refused (rc $clean_rc)."
             exit 1
           fi
-          echo "armed: seeded leak exits $leak_rc, clean message exits $clean_rc"
+          # THE TAG PATH NEEDS ITS OWN ARMED CHECK, and this step did not have
+          # one. A non-author mutation set found that blinding `tag_messages()`
+          # -- making it return nothing -- left the self-test passing AND this
+          # step passing, so the tag half of the gate could stop working with no
+          # run saying so. Five other mutations were caught; that one was not.
+          #
+          # It is the load-bearing half: tags are a live publishing channel here,
+          # and a tag placed on an already-published commit is exactly the case
+          # the commit walk structurally cannot see.
+          git tag -a seeded-leak -m "seeded tag: host 192.168.1.1 must be refused"
+          set +e
+          python3 "$lint" --tags
+          tag_leak_rc=$?
+          set -e
+          if [ "$tag_leak_rc" -eq 0 ]; then
+            echo "ARMED CHECK FAILED: a seeded leak in a TAG message did not fail"
+            echo "the checker. The tag half of the gate is not gating."
+            exit 1
+          fi
+
+          git tag -d seeded-leak >/dev/null
+          git tag -a clean-tag -m "clean tag: no environment detail here"
+          set +e
+          python3 "$lint" --tags
+          tag_clean_rc=$?
+          set -e
+          if [ "$tag_clean_rc" -ne 0 ]; then
+            echo "ARMED CHECK FAILED: a clean TAG message was refused (rc $tag_clean_rc)."
+            exit 1
+          fi
+
+          echo "armed: commit leak $leak_rc / clean $clean_rc;" \
+               "tag leak $tag_leak_rc / clean $tag_clean_rc"
 
       - name: Lint commit messages introduced by this change
         env:
