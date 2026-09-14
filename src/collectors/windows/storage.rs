@@ -37,7 +37,7 @@ impl StorageCollector {
     fn init_pdh(&mut self) {
         match self.try_init_pdh() {
             Ok(()) => self.initialized = true,
-            Err(e) => tracing::warn!("StorageCollector PDH init failed: {e:#}"),
+            Err(e) => tracing::warn!("StorageCollector PDH init failed: {e}"),
         }
     }
 
@@ -71,7 +71,7 @@ impl Collector for StorageCollector {
             None => return Ok(None),
         };
         if let Err(e) = query.collect() {
-            tracing::warn!("StorageCollector PDH collect failed: {e:#}");
+            tracing::warn!("StorageCollector PDH collect failed: {e}");
             return Ok(None);
         }
 
