@@ -146,3 +146,289 @@ fn dirs_or_home() -> Option<PathBuf> {
     }
     std::env::var("HOME").ok().map(PathBuf::from)
 }
+
+/// Reduce an endpoint to a bare `scheme://host[:port]` origin, or `None`.
+///
+/// DELIBERATELY SEPARATE FROM THE AGENT'S `handshake::endpoint_origin`, which is
+/// its sibling and does the same job. They are not shared, and the reason is not
+/// that sharing was hard -- the daemon already has `reqwest::Url` in reach, so a
+/// shared crate would have cost no new dependency.
+///
+/// The agent's copy serves TWO consumers with OPPOSITE failure preferences: in
+/// its startup preflight a `None` is FATAL, so the function is a VALIDATOR there,
+/// while in its shipper a `None` merely costs a word in a log line. Its own doc
+/// says a change that improves one regresses the other. This crate needs only the
+/// REDACTOR half and is never fatal, so binding the daemon's logging to the
+/// agent's validator across a workspace boundary would let a future relaxation
+/// made for a log line silently widen what the agent's handshake ACCEPTS.
+///
+/// The cost of that choice is drift, and it is real: the agent's copy shipped an
+/// IPv6 double-bracketing bug. The mitigation is that the tests below pin the SAME
+/// rejection vectors as the agent's, so the two can be diffed by eye.
+///
+/// REJECTS rather than sanitises: userinfo, a username, a password, a query, a
+/// fragment, a non-`http(s)` scheme, or a path that does not NORMALISE to empty or
+/// `/` all yield `None`. Note *normalise*: `http://host/a/..` collapses to `/` and
+/// is accepted, returning `http://host` -- the segment is dropped, not echoed. The
+/// guarantee is "the output is assembled only from scheme, host and port", NOT
+/// "any input with a path is refused".
+pub fn endpoint_origin_for_log(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || has_userinfo(value, &url)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return None;
+    }
+    // `Url::host_str` already returns an IPv6 authority bracketed (`[::1]`), so it
+    // is used as-is. Bracketing it again is the bug the agent's copy shipped.
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    })
+}
+
+/// `Url` normalises an empty username away when serialised, so inspect the parsed
+/// input's authority rather than `Url::username()` alone. Fails CLOSED: anything it
+/// cannot slice is treated as carrying userinfo.
+fn has_userinfo(input: &str, url: &reqwest::Url) -> bool {
+    // PARSER PREPROCESSING, WHICH RUNS BEFORE THE STATE MACHINE BELOW IS ABOUT.
+    // The WHATWG parser first strips leading and trailing C0 controls and spaces
+    // from the whole input, and then DELETES every remaining ASCII tab, LF and CR
+    // anywhere in it. A scan over the RAW bytes is therefore looking at a string
+    // the parser never parsed.
+    //
+    // Measured at the daemon's real log site, against an unmutated binary:
+    // `http://<TAB>/@127.0.0.1:9200` was emitted as `http://127.0.0.1:9200`. The
+    // parser deletes the tab, leaving `http:///@host` whose authority is `@host`;
+    // the raw scan sees `<TAB>/@host`, finds its delimiter at index 1, and reads
+    // an authority of `<TAB>` with no `@`. The surplus-slash refusal below cannot
+    // see it, because the deleted byte sits IN FRONT of the slash.
+    //
+    // TRIM FIRST, THEN REFUSE, and the order is load-bearing. Trimming mirrors the
+    // parser's own strip, so an endpoint with a stray trailing newline keeps
+    // working; refusing that outright would be a FATAL preflight on the agent
+    // side, not a lost log line. Anything that survives the trim is INTERIOR, and
+    // interior deletion is precisely the divergence a raw scan cannot model.
+    let input = input.trim_matches(|c: char| c <= '\u{20}');
+    if input.contains(['\t', '\n', '\r']) {
+        return true;
+    }
+    let Some(authority) = input
+        .get(url.scheme().len() + 1..)
+        .and_then(|rest| rest.strip_prefix("//"))
+    else {
+        return true;
+    };
+    // SURPLUS AUTHORITY SLASHES. For a special scheme the WHATWG parser consumes
+    // `//` and then IGNORES any further `/` or `\` before the authority, so in
+    // `http:///@host` the parser's authority is `@host` while this scan, having
+    // removed exactly two slashes, sees a delimiter at index 0, reads an EMPTY
+    // authority and reports no `@`. The parsed username/password checks then pass
+    // too, because the userinfo is empty. Measured: `http:///@host`,
+    // `http:////@host` and `http:///:@host` all reached the log as `http://host`,
+    // defeating the deliberate rejection of even empty userinfo that the
+    // `http://@host` case exists to pin.
+    //
+    // Refuse the ambiguous shape outright rather than re-implementing the
+    // parser's slash skipping here. A scan written to mirror a parser is a second
+    // implementation of it, and the two drift -- which is the whole defect above,
+    // in miniature. Refusing strictly WIDENS rejection, so it stays on the
+    // fail-closed side of this function's contract.
+    if authority.starts_with('/') || authority.starts_with('\\') {
+        return true;
+    }
+    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    authority[..authority_end].contains('@')
+}
+
+/// The endpoint as it may appear in a log line: a bare origin, or `<redacted>`.
+///
+/// Never fatal and never partial -- an endpoint that cannot be shown to be
+/// credential-free is withheld entirely rather than scrubbed.
+pub fn endpoint_for_log(value: &str) -> String {
+    endpoint_origin_for_log(value).unwrap_or_else(|| "<redacted>".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These vectors are kept IDENTICAL to the agent's `endpoint_origin` tests on
+    /// purpose. The two functions are deliberate duplicates, so the defence against
+    /// them drifting apart is that their test tables can be compared line by line.
+    /// If you change one, change the other or record why they now differ.
+    #[test]
+    fn rejects_every_endpoint_it_cannot_prove_credential_free() {
+        for bad in [
+            "ftp://host",
+            "http://",
+            "http://@host",
+            "http://u:p@host",
+            "http://host/x",
+            "http://host/?x",
+            "http://host/#x",
+            // Surplus authority slashes. The parser ignores them and reads the
+            // userinfo the raw scan could not see, so all three of these reached
+            // the log as `http://host` before the scan refused the shape. They
+            // are the regression for that, and they carry no credential on
+            // purpose: the contract rejects EVEN EMPTY userinfo, so a vector
+            // that leaks nothing is exactly the one that pins the contract
+            // rather than the consequence.
+            "http:///@host",
+            "http:////@host",
+            "http:///:@host",
+            // The BACKSLASH arm on its own. Every vector above is caught by the
+            // leading-`/` arm too, so without this one the `\\` disjunct is dead
+            // weight that no test touches -- a non-author review deleted it and
+            // both suites stayed green. A control's discrimination has to be shown
+            // per BRANCH, not per mutation.
+            "http://\\/@host",
+            // The PARSER-DELETION arm. The parser removes these bytes before it
+            // parses, so each of these reaches it as `http:///@host`. Measured
+            // reaching the real log site as `http://host` before the refusal
+            // above existed.
+            "http://\t/@host",
+            "http://\n/@host",
+            "http://\r/@host",
+        ] {
+            assert!(endpoint_origin_for_log(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn keeps_an_endpoint_that_is_provably_clean() {
+        assert_eq!(
+            endpoint_origin_for_log("https://host:9200/").as_deref(),
+            Some("https://host:9200")
+        );
+        assert_eq!(
+            endpoint_origin_for_log("http://127.0.0.1:9200").as_deref(),
+            Some("http://127.0.0.1:9200")
+        );
+    }
+
+    #[test]
+    fn the_output_is_assembled_from_scheme_host_port_and_is_never_the_input() {
+        // The doc promises "the output is assembled only from scheme, host and
+        // port". Nothing tested that. An implementation that returns the INPUT
+        // once the checks pass satisfies every other test in this module, and a
+        // non-author review demonstrated exactly that mutant passing the whole
+        // 30-test workspace while the real daemon printed the secret.
+        //
+        // `Url` NORMALISES `/secretcanary/..` away to `/`, so the path check sees
+        // a clean root and accepts. That is the point: acceptance is correct here
+        // and returning the raw input is still a disclosure. Only an equality
+        // assertion against the ASSEMBLED origin can tell the two apart --
+        // asserting `is_some()` cannot.
+        assert_eq!(
+            endpoint_origin_for_log("http://host/secretcanary/..").as_deref(),
+            Some("http://host")
+        );
+        assert_eq!(
+            endpoint_origin_for_log("http://host/%2e%2e/secretcanary/..").as_deref(),
+            Some("http://host")
+        );
+        // The wrapper carries the same guarantee, so pin it at that level too.
+        assert_eq!(
+            endpoint_for_log("http://host/secretcanary/.."),
+            "http://host"
+        );
+    }
+
+    #[test]
+    fn the_wrapper_shows_a_clean_endpoint_rather_than_redacting_everything() {
+        // A positive control. Every other wrapper assertion in this module checks
+        // that something is WITHHELD, so a wrapper that returned "<redacted>"
+        // unconditionally would satisfy all of them -- it would be maximally
+        // "safe" and completely useless, and no test would notice. Measured by a
+        // non-author review as mutant M11.
+        for clean in [
+            "http://127.0.0.1:9200",
+            "https://host:9200/",
+            "https://[::1]:9200/",
+        ] {
+            let shown = endpoint_for_log(clean);
+            assert_ne!(
+                shown, "<redacted>",
+                "a provably clean endpoint must be shown, not withheld: {clean}"
+            );
+            assert_eq!(
+                Some(shown.as_str()),
+                endpoint_origin_for_log(clean).as_deref(),
+                "the wrapper must return the origin verbatim for {clean}"
+            );
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_rather_than_refused() {
+        // WHY THE TRIM MUST COME BEFORE THE REFUSAL, pinned so the order cannot
+        // be swapped silently. The parser strips leading and trailing C0 controls
+        // and space from the whole input before it does anything else, so an
+        // endpoint with a stray trailing newline is a perfectly good endpoint to
+        // it. If the control refusal ran FIRST, this would be refused -- which on
+        // the agent side is a FATAL preflight, not a lost log line, so the cost of
+        // getting the order wrong is not symmetric.
+        for padded in [
+            "http://127.0.0.1:9200\n",
+            "\thttp://127.0.0.1:9200",
+            "  http://127.0.0.1:9200  ",
+            "http://127.0.0.1:9200\r\n",
+            // PINS THE PREDICATE, not just the order. Every vector above uses
+            // space, tab, LF or CR -- the characters on which EVERY plausible
+            // trim agrees -- so `str::trim()` or `char::is_whitespace` could be
+            // substituted for the shipped `c <= '\u{20}'` and no test would
+            // notice. A non-author review measured that: seven survivors, and
+            // `str::trim()` differs from the shipped predicate on 411 of 539,334
+            // inputs. U+0000 and U+001F are C0 controls that the parser strips
+            // and that neither of those substitutes touches, so they separate
+            // the predicates rather than merely exercising one.
+            "\u{0}http://127.0.0.1:9200\u{1f}",
+        ] {
+            assert_eq!(
+                endpoint_origin_for_log(padded).as_deref(),
+                Some("http://127.0.0.1:9200"),
+                "surrounding whitespace must be trimmed, not refused: {padded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn brackets_ipv6_exactly_once() {
+        // Written correctly here from the start. The agent's sibling shipped
+        // `[[::1]]`, which is not a parseable URL once a path is appended.
+        assert_eq!(
+            endpoint_origin_for_log("https://[::1]:9200/").as_deref(),
+            Some("https://[::1]:9200")
+        );
+        let origin = endpoint_origin_for_log("https://[2001:db8::1]/").expect("origin");
+        assert_eq!(origin, "https://[2001:db8::1]");
+        assert!(reqwest::Url::parse(&format!("{origin}/_bulk")).is_ok());
+    }
+
+    #[test]
+    fn a_credential_bearing_endpoint_is_withheld_whole() {
+        let cfg_endpoint = "https://u:hunter2@es.example:9200/?api_key=CANARY";
+        assert!(endpoint_origin_for_log(cfg_endpoint).is_none());
+        let shown = endpoint_for_log(cfg_endpoint);
+        for leak in ["hunter2", "CANARY"] {
+            assert!(!shown.contains(leak), "{leak} survived into {shown}");
+        }
+        assert_eq!(shown, "<redacted>");
+    }
+
+    #[test]
+    fn a_non_url_endpoint_is_withheld_rather_than_echoed() {
+        // `endpoint` is an unvalidated bare String and need not be a URL at all.
+        for junk in ["", "not a url", "es.example:9200", "file:///etc/passwd"] {
+            assert_eq!(endpoint_for_log(junk), "<redacted>", "{junk}");
+        }
+    }
+}
