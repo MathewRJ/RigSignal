@@ -614,12 +614,11 @@ pub(crate) fn endpoint_origin(value: &str) -> Option<String> {
     {
         return None;
     }
+    // `Url::host_str` already returns an IPv6 authority in its bracketed form
+    // (`[::1]`), so bracketing it again here produced `[[::1]]` — an origin that
+    // is not a parseable URL once a path is appended, which took the handshake
+    // down for every IPv6 endpoint rather than merely looking wrong.
     let host = url.host_str()?;
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    };
     Some(match url.port() {
         Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
         None => format!("{}://{}", url.scheme(), host),
@@ -2045,6 +2044,34 @@ mod tests {
         for (probe, fixture) in fixtures {
             assert_eq!(probe.json_line().unwrap(), fixture);
         }
+    }
+
+    #[test]
+    fn endpoint_origin_brackets_ipv6_exactly_once() {
+        // What the helper actually returns for an IPv6 authority.
+        assert_eq!(
+            endpoint_origin("https://[::1]:9200/").as_deref(),
+            Some("https://[::1]:9200")
+        );
+        assert_eq!(
+            endpoint_origin("https://[2001:db8::1]/").as_deref(),
+            Some("https://[2001:db8::1]")
+        );
+        // The functional half: the origin is concatenated with a path and used as
+        // a request URL, so it has to survive a re-parse. Double-bracketing did not.
+        for endpoint in ["https://[::1]:9200/", "https://[2001:db8::1]/"] {
+            let origin = endpoint_origin(endpoint).expect("origin");
+            let url = format!("{origin}/_cluster/health");
+            assert!(
+                reqwest::Url::parse(&url).is_ok(),
+                "origin does not re-parse with a path appended: {url}"
+            );
+        }
+        // IPv4 and named hosts keep their existing shape.
+        assert_eq!(
+            endpoint_origin("https://192.0.2.1:9200/").as_deref(),
+            Some("https://192.0.2.1:9200")
+        );
     }
 
     #[test]
