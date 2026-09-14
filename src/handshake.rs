@@ -634,6 +634,24 @@ fn url_has_userinfo(input: &str, url: &reqwest::Url) -> bool {
     else {
         return true;
     };
+    // SURPLUS AUTHORITY SLASHES. For a special scheme the WHATWG parser consumes
+    // `//` and then IGNORES any further `/` or `\` before the authority, so in
+    // `http:///@host` the parser's authority is `@host` while this scan, having
+    // removed exactly two slashes, sees a delimiter at index 0, reads an EMPTY
+    // authority and reports no `@`. The parsed username/password checks then pass
+    // too, because the userinfo is empty. Measured: `http:///@host`,
+    // `http:////@host` and `http:///:@host` all reached the log as `http://host`,
+    // defeating the deliberate rejection of even empty userinfo that the
+    // `http://@host` case exists to pin.
+    //
+    // Refuse the ambiguous shape outright rather than re-implementing the
+    // parser's slash skipping here. A scan written to mirror a parser is a second
+    // implementation of it, and the two drift -- which is the whole defect above,
+    // in miniature. Refusing strictly WIDENS rejection, so it stays on the
+    // fail-closed side of this function's contract.
+    if authority.starts_with('/') || authority.starts_with('\\') {
+        return true;
+    }
     let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     authority[..authority_end].contains('@')
 }
@@ -2047,6 +2065,18 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_origin_is_assembled_not_echoed() {
+        // Same guarantee as the daemon sibling, and it was equally untested here.
+        // `Url` normalises `/secretcanary/..` to `/`, so the path check accepts;
+        // an implementation that echoed the input would pass every other
+        // assertion in this module while disclosing the path.
+        assert_eq!(
+            endpoint_origin("http://host/secretcanary/..").as_deref(),
+            Some("http://host")
+        );
+    }
+
+    #[test]
     fn endpoint_origin_brackets_ipv6_exactly_once() {
         // What the helper actually returns for an IPv6 authority.
         assert_eq!(
@@ -2084,6 +2114,16 @@ mod tests {
             "http://host/x",
             "http://host/?x",
             "http://host/#x",
+            // Surplus authority slashes. The parser ignores them and reads the
+            // userinfo the raw scan could not see, so all three of these reached
+            // the log as `http://host` before the scan refused the shape. They
+            // are the regression for that, and they carry no credential on
+            // purpose: the contract rejects EVEN EMPTY userinfo, so a vector
+            // that leaks nothing is exactly the one that pins the contract
+            // rather than the consequence.
+            "http:///@host",
+            "http:////@host",
+            "http:///:@host",
         ] {
             assert!(endpoint_origin(bad).is_none(), "{bad}");
         }

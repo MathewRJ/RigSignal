@@ -204,6 +204,24 @@ fn has_userinfo(input: &str, url: &reqwest::Url) -> bool {
     else {
         return true;
     };
+    // SURPLUS AUTHORITY SLASHES. For a special scheme the WHATWG parser consumes
+    // `//` and then IGNORES any further `/` or `\` before the authority, so in
+    // `http:///@host` the parser's authority is `@host` while this scan, having
+    // removed exactly two slashes, sees a delimiter at index 0, reads an EMPTY
+    // authority and reports no `@`. The parsed username/password checks then pass
+    // too, because the userinfo is empty. Measured: `http:///@host`,
+    // `http:////@host` and `http:///:@host` all reached the log as `http://host`,
+    // defeating the deliberate rejection of even empty userinfo that the
+    // `http://@host` case exists to pin.
+    //
+    // Refuse the ambiguous shape outright rather than re-implementing the
+    // parser's slash skipping here. A scan written to mirror a parser is a second
+    // implementation of it, and the two drift -- which is the whole defect above,
+    // in miniature. Refusing strictly WIDENS rejection, so it stays on the
+    // fail-closed side of this function's contract.
+    if authority.starts_with('/') || authority.starts_with('\\') {
+        return true;
+    }
     let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     authority[..authority_end].contains('@')
 }
@@ -234,6 +252,16 @@ mod tests {
             "http://host/x",
             "http://host/?x",
             "http://host/#x",
+            // Surplus authority slashes. The parser ignores them and reads the
+            // userinfo the raw scan could not see, so all three of these reached
+            // the log as `http://host` before the scan refused the shape. They
+            // are the regression for that, and they carry no credential on
+            // purpose: the contract rejects EVEN EMPTY userinfo, so a vector
+            // that leaks nothing is exactly the one that pins the contract
+            // rather than the consequence.
+            "http:///@host",
+            "http:////@host",
+            "http:///:@host",
         ] {
             assert!(endpoint_origin_for_log(bad).is_none(), "{bad}");
         }
@@ -249,6 +277,56 @@ mod tests {
             endpoint_origin_for_log("http://127.0.0.1:9200").as_deref(),
             Some("http://127.0.0.1:9200")
         );
+    }
+
+    #[test]
+    fn the_output_is_ASSEMBLED_from_scheme_host_port_and_is_never_the_INPUT() {
+        // The doc promises "the output is assembled only from scheme, host and
+        // port". Nothing tested that. An implementation that returns the INPUT
+        // once the checks pass satisfies every other test in this module, and a
+        // non-author review demonstrated exactly that mutant passing the whole
+        // 30-test workspace while the real daemon printed the secret.
+        //
+        // `Url` NORMALISES `/secretcanary/..` away to `/`, so the path check sees
+        // a clean root and accepts. That is the point: acceptance is correct here
+        // and returning the raw input is still a disclosure. Only an equality
+        // assertion against the ASSEMBLED origin can tell the two apart --
+        // asserting `is_some()` cannot.
+        assert_eq!(
+            endpoint_origin_for_log("http://host/secretcanary/..").as_deref(),
+            Some("http://host")
+        );
+        assert_eq!(
+            endpoint_origin_for_log("http://host/%2e%2e/secretcanary/..").as_deref(),
+            Some("http://host")
+        );
+        // The wrapper carries the same guarantee, so pin it at that level too.
+        assert_eq!(endpoint_for_log("http://host/secretcanary/.."), "http://host");
+    }
+
+    #[test]
+    fn the_wrapper_SHOWS_a_clean_endpoint_rather_than_redacting_everything() {
+        // A positive control. Every other wrapper assertion in this module checks
+        // that something is WITHHELD, so a wrapper that returned "<redacted>"
+        // unconditionally would satisfy all of them -- it would be maximally
+        // "safe" and completely useless, and no test would notice. Measured by a
+        // non-author review as mutant M11.
+        for clean in [
+            "http://127.0.0.1:9200",
+            "https://host:9200/",
+            "https://[::1]:9200/",
+        ] {
+            let shown = endpoint_for_log(clean);
+            assert_ne!(
+                shown, "<redacted>",
+                "a provably clean endpoint must be shown, not withheld: {clean}"
+            );
+            assert_eq!(
+                Some(shown.as_str()),
+                endpoint_origin_for_log(clean).as_deref(),
+                "the wrapper must return the origin verbatim for {clean}"
+            );
+        }
     }
 
     #[test]
