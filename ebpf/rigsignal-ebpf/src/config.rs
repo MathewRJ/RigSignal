@@ -198,6 +198,28 @@ pub fn endpoint_origin_for_log(value: &str) -> Option<String> {
 /// input's authority rather than `Url::username()` alone. Fails CLOSED: anything it
 /// cannot slice is treated as carrying userinfo.
 fn has_userinfo(input: &str, url: &reqwest::Url) -> bool {
+    // PARSER PREPROCESSING, WHICH RUNS BEFORE THE STATE MACHINE BELOW IS ABOUT.
+    // The WHATWG parser first strips leading and trailing C0 controls and spaces
+    // from the whole input, and then DELETES every remaining ASCII tab, LF and CR
+    // anywhere in it. A scan over the RAW bytes is therefore looking at a string
+    // the parser never parsed.
+    //
+    // Measured at the daemon's real log site, against an unmutated binary:
+    // `http://<TAB>/@127.0.0.1:9200` was emitted as `http://127.0.0.1:9200`. The
+    // parser deletes the tab, leaving `http:///@host` whose authority is `@host`;
+    // the raw scan sees `<TAB>/@host`, finds its delimiter at index 1, and reads
+    // an authority of `<TAB>` with no `@`. The surplus-slash refusal below cannot
+    // see it, because the deleted byte sits IN FRONT of the slash.
+    //
+    // TRIM FIRST, THEN REFUSE, and the order is load-bearing. Trimming mirrors the
+    // parser's own strip, so an endpoint with a stray trailing newline keeps
+    // working; refusing that outright would be a FATAL preflight on the agent
+    // side, not a lost log line. Anything that survives the trim is INTERIOR, and
+    // interior deletion is precisely the divergence a raw scan cannot model.
+    let input = input.trim_matches(|c: char| c <= '\u{20}');
+    if input.contains(['\t', '\n', '\r']) {
+        return true;
+    }
     let Some(authority) = input
         .get(url.scheme().len() + 1..)
         .and_then(|rest| rest.strip_prefix("//"))
@@ -262,6 +284,19 @@ mod tests {
             "http:///@host",
             "http:////@host",
             "http:///:@host",
+            // The BACKSLASH arm on its own. Every vector above is caught by the
+            // leading-`/` arm too, so without this one the `\\` disjunct is dead
+            // weight that no test touches -- a non-author review deleted it and
+            // both suites stayed green. A control's discrimination has to be shown
+            // per BRANCH, not per mutation.
+            "http://\\/@host",
+            // The PARSER-DELETION arm. The parser removes these bytes before it
+            // parses, so each of these reaches it as `http:///@host`. Measured
+            // reaching the real log site as `http://host` before the refusal
+            // above existed.
+            "http://\t/@host",
+            "http://\n/@host",
+            "http://\r/@host",
         ] {
             assert!(endpoint_origin_for_log(bad).is_none(), "{bad}");
         }
@@ -280,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn the_output_is_ASSEMBLED_from_scheme_host_port_and_is_never_the_INPUT() {
+    fn the_output_is_assembled_from_scheme_host_port_and_is_never_the_input() {
         // The doc promises "the output is assembled only from scheme, host and
         // port". Nothing tested that. An implementation that returns the INPUT
         // once the checks pass satisfies every other test in this module, and a
@@ -301,11 +336,14 @@ mod tests {
             Some("http://host")
         );
         // The wrapper carries the same guarantee, so pin it at that level too.
-        assert_eq!(endpoint_for_log("http://host/secretcanary/.."), "http://host");
+        assert_eq!(
+            endpoint_for_log("http://host/secretcanary/.."),
+            "http://host"
+        );
     }
 
     #[test]
-    fn the_wrapper_SHOWS_a_clean_endpoint_rather_than_redacting_everything() {
+    fn the_wrapper_shows_a_clean_endpoint_rather_than_redacting_everything() {
         // A positive control. Every other wrapper assertion in this module checks
         // that something is WITHHELD, so a wrapper that returned "<redacted>"
         // unconditionally would satisfy all of them -- it would be maximally
@@ -325,6 +363,29 @@ mod tests {
                 Some(shown.as_str()),
                 endpoint_origin_for_log(clean).as_deref(),
                 "the wrapper must return the origin verbatim for {clean}"
+            );
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed_rather_than_refused() {
+        // WHY THE TRIM MUST COME BEFORE THE REFUSAL, pinned so the order cannot
+        // be swapped silently. The parser strips leading and trailing C0 controls
+        // and space from the whole input before it does anything else, so an
+        // endpoint with a stray trailing newline is a perfectly good endpoint to
+        // it. If the control refusal ran FIRST, this would be refused -- which on
+        // the agent side is a FATAL preflight, not a lost log line, so the cost of
+        // getting the order wrong is not symmetric.
+        for padded in [
+            "http://127.0.0.1:9200\n",
+            "\thttp://127.0.0.1:9200",
+            "  http://127.0.0.1:9200  ",
+            "http://127.0.0.1:9200\r\n",
+        ] {
+            assert_eq!(
+                endpoint_origin_for_log(padded).as_deref(),
+                Some("http://127.0.0.1:9200"),
+                "surrounding whitespace must be trimmed, not refused: {padded:?}"
             );
         }
     }
