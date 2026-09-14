@@ -381,6 +381,16 @@ mod tests {
             "\thttp://127.0.0.1:9200",
             "  http://127.0.0.1:9200  ",
             "http://127.0.0.1:9200\r\n",
+            // PINS THE PREDICATE, not just the order. Every vector above uses
+            // space, tab, LF or CR -- the characters on which EVERY plausible
+            // trim agrees -- so `str::trim()` or `char::is_whitespace` could be
+            // substituted for the shipped `c <= '\u{20}'` and no test would
+            // notice. A non-author review measured that: seven survivors, and
+            // `str::trim()` differs from the shipped predicate on 411 of 539,334
+            // inputs. U+0000 and U+001F are C0 controls that the parser strips
+            // and that neither of those substitutes touches, so they separate
+            // the predicates rather than merely exercising one.
+            "\u{0}http://127.0.0.1:9200\u{1f}",
         ] {
             assert_eq!(
                 endpoint_origin_for_log(padded).as_deref(),

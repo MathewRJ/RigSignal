@@ -46,6 +46,29 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 /// Run the daemon against a config holding `endpoint`, and return (stdout, stderr).
 fn start_daemon_with(endpoint: &str, tag: &str) -> (String, String, String) {
+    // PIN THE ASSUMPTION THE ABSENCE ASSERTIONS REST ON.
+    //
+    // The `env_remove` calls below protect the CHILD, and the per-test positive
+    // control proves this test's ENDPOINT reached the log line. Neither covers
+    // ES_API_KEY: the control asserts an endpoint, and an overridden key is simply
+    // a different secret, which the canary check then does not find. A non-author
+    // review measured the gap -- with the log site poisoned to print the key and
+    // only this one `env_remove` deleted, the daemon logged an api key and ZERO
+    // tests went red.
+    //
+    // Asserting here makes the dependency visible and LOUD. It fails in a polluted
+    // environment where the product is fine, and that is the trade taken on
+    // purpose: a diagnosable failure beats a silent vacuity, which is the failure
+    // mode this whole file exists to prevent.
+    for var in ["ES_URL", "ES_API_KEY", "ES_CA_CERT"] {
+        assert!(
+            std::env::var(var).is_err(),
+            "{var} is set in this test process. The child has it removed, so the \
+             product is unaffected -- but if a future edit drops that removal, the \
+             absence assertions in this file go vacuous silently. Unset it and re-run."
+        );
+    }
+
     let dir = temp_dir(tag);
     let config = dir.join("rigsignal.toml");
     fs::write(

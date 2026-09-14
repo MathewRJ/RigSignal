@@ -2107,6 +2107,11 @@ mod tests {
             "https://host:9200/\n",
             "\thttps://host:9200/",
             "  https://host:9200/  ",
+            // Pins the PREDICATE as well as the order -- see the daemon sibling.
+            // U+0000 and U+001F are trimmed by `c <= '\u{20}'` and by neither
+            // `str::trim()` nor `char::is_whitespace`, so they separate the
+            // candidate predicates instead of merely exercising one.
+            "\u{0}https://host:9200/\u{1f}",
         ] {
             assert_eq!(
                 endpoint_origin(padded).as_deref(),
