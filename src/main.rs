@@ -1977,6 +1977,143 @@ mod tests {
         );
     }
 
+    /// The PREDICATE, against synthetic strings rather than today's corpus.
+    ///
+    /// Without this, the only exercise the match gets is the real file, so the day
+    /// the corpus stops containing a form is the day that form silently stops
+    /// being tested. The negative cases matter as much as the positive ones: this
+    /// predicate is a substring match and is much broader than the whole
+    /// placeholders it replaced.
+    #[test]
+    fn the_alternate_render_predicate_matches_every_spelling_and_no_width_spec() {
+        for caught in [
+            "\"x: {:#}\", e",
+            "\"x: {e:#}\"",
+            "\"x: {0:#}\", e",
+            "\"x: {name:#}\"",
+            "\"x: {:?}\", e",
+            "\"x: {e:?}\"",
+            "\"x: {:#?}\", e",
+            "\"x: {e:#?}\"",
+        ] {
+            assert!(
+                alternate_or_debug_render(caught).is_some(),
+                "not caught: {caught}"
+            );
+        }
+        for allowed in [
+            "\"plain {}\", e",
+            "\"width {:>8}\", n",
+            "\"precision {:.3}\", f",
+            "\"named {name}\"",
+            "\"hex {:#x}\", n",
+            "%error, \"structured field\"",
+        ] {
+            assert!(
+                alternate_or_debug_render(allowed).is_none(),
+                "false positive: {allowed}"
+            );
+        }
+    }
+
+    /// The SCANNER itself, against a corpus built to contain what the real file
+    /// does not.
+    ///
+    /// `warning_call_sites` had exactly one caller -- the guard above, passing the
+    /// real `main.rs`. So every edge it handles was exercised only to the extent
+    /// this one file happens to contain that edge, and the file is a poor corpus:
+    /// it holds 26 `tracing::warn!` sites and just 2 `tracing::error!`, and it has
+    /// no warning whose body contains a `)` inside a string, or a `'('` char
+    /// literal, or a call opened mid-expression. The scanner's handling of each of
+    /// those is written down and was never executed against a case that could
+    /// distinguish it.
+    ///
+    /// A guard whose scanner is untested fails in the quiet direction: a dropped
+    /// site is not reported as an error, it is simply never checked. The count
+    /// cross-check in the guard above catches a drop only for the two patterns it
+    /// naively counts, and cannot see a body that was truncated early.
+    #[test]
+    fn the_call_scanner_sees_every_form_the_corpus_contains() {
+        // Assembled from pieces so this corpus is not itself a plausible target of
+        // the guard above -- which cuts at the top-level test module anyway, but
+        // relying on two things at once is how a fixture goes quietly vacuous.
+        let corpus = concat!(
+            "fn a() {\n",
+            "    tracing::warn!(\"plain\");\n",
+            "    if x { tracing::error!(\"not at line start\"); }\n",
+            "    tracing::warn!(\n",
+            "        \"the multi-line form rustfmt produces: {}\",\n",
+            "        err\n",
+            "    );\n",
+            "    tracing::warn!(\"a close paren ) inside a string\");\n",
+            "    tracing::error!(\"a char literal {} here\", '(');\n",
+            "    tracing::warn!(\"nested {}\", f(g(1), h(2)));\n",
+            "}\n",
+        );
+
+        let sites = warning_call_sites(corpus);
+
+        // Assert the SETUP first: if the corpus stopped containing both macro
+        // spellings, every assertion below would still pass while checking less.
+        assert_eq!(
+            corpus.matches("tracing::warn!").count(),
+            4,
+            "corpus no longer holds the warn! cases this test claims to cover"
+        );
+        assert_eq!(
+            corpus.matches("tracing::error!").count(),
+            2,
+            "corpus no longer holds the error! cases this test claims to cover"
+        );
+
+        assert_eq!(
+            sites.len(),
+            6,
+            "scanner found {} of 6 sites: {sites:?}",
+            sites.len()
+        );
+        for (line_no, body) in &sites {
+            assert_ne!(body, "<UNPARSEABLE>", "line {line_no} was not delimited");
+        }
+
+        let bodies: Vec<&str> = sites.iter().map(|(_, b)| b.as_str()).collect();
+
+        // `error!` is found at all -- the branch the real file barely exercises.
+        assert!(bodies.iter().any(|b| b.contains("not at line start")));
+        // A call that does not begin its line is still found, at the right line.
+        // Looked up by CONTENT, not by index: the scanner walks one macro spelling
+        // to exhaustion before starting the next, so the returned order is
+        // pattern-major, not line order. Indexing positionally here would pin that
+        // ordering as if it were a promise.
+        let mid_line = sites
+            .iter()
+            .find(|(_, b)| b.contains("not at line start"))
+            .expect("the mid-line call was not found at all");
+        assert_eq!(mid_line.0, 3, "line number wrong for the mid-line call");
+        // The multi-line form is joined into one normalised body.
+        assert!(
+            bodies.contains(&"\"the multi-line form rustfmt produces: {}\", err"),
+            "multi-line body not normalised: {bodies:?}"
+        );
+        // A `)` inside a string does not end the body early.
+        assert!(
+            bodies.contains(&"\"a close paren ) inside a string\""),
+            "string-internal close paren truncated the body: {bodies:?}"
+        );
+        // A `'('` char literal does not inflate the depth.
+        assert!(
+            bodies
+                .iter()
+                .any(|b| b.contains("a char literal") && b.ends_with("'('")),
+            "char literal mis-consumed: {bodies:?}"
+        );
+        // Nested calls are spanned whole.
+        assert!(
+            bodies.contains(&"\"nested {}\", f(g(1), h(2))"),
+            "nested parens truncated the body: {bodies:?}"
+        );
+    }
+
     /// The rejected design must not come back, and partial wiring must not pass.
     ///
     /// A non-author review demonstrated both gaps by mutation: routing only ONE
@@ -2080,12 +2217,24 @@ mod tests {
         // THIS IS A WAIVER LIST, NOT A PROOF, and the name says so because the
         // previous revision called it STATIC_OUTERMOST_CONTEXT and asserted that
         // every entry's outermost layer was a static literal. A non-author review
-        // falsified that for ALL SEVEN entries: `shipper::ping`, `ship_documents`
-        // and `trigger_transform_sync` each call `build_client(config)?` with a
-        // bare `?`, so a CA-cert read failure makes
+        // falsified that for EVERY entry in the list below, by two distinct routes.
+        // (The phrase used to say "all seven". The list was seven entries when that
+        // was written and is eight now, so the number is deliberately gone rather
+        // than bumped: a count restated in prose beside a compiler-checked array
+        // goes stale silently, and this one did.)
+        //
+        // ROUTE ONE IS NOW CLOSED: `shipper::ping`, `ship_documents` and
+        // `trigger_transform_sync` each called `build_client(config)?` with a bare
+        // `?`, so a CA-cert read failure made
         // `format!("reading Elasticsearch CA cert: {}", path.display())` the
-        // outermost layer; the remote_connections entries resolve into
-        // path-interpolating contexts the same way.
+        // outermost layer. `build_client` now wraps its own body in a static
+        // context, so that path no longer surfaces at a `{}` render. It is still
+        // present in the DEEPER layers, so `{:#}` or `{:?}` would reach it.
+        //
+        // ROUTE TWO REMAINS OPEN: the remote_connections entries resolve into
+        // path-interpolating contexts of their own (many `with_context(|| format!
+        // ("... {}", path.display()))` sites in that file), and closing route one
+        // did nothing for them.
         //
         // Nothing here checks a row. A row that claims more than it can show turns
         // a live leak into a documented exemption, which is worse than no row --
@@ -2122,20 +2271,32 @@ mod tests {
         );
 
         // ── No alternate error formatting, at ANY position ───────────────────
-        // `{:#}` prints every cause verbatim. So does `{:?}`, which ALSO spans
-        // lines -- it is simultaneously the credential leak and the forged
-        // second line that `error_for_log_never_emits_a_forged_second_line`
-        // exists to prevent. The previous revision blocked only `{:#}`, while the
-        // comment at the preflight site named `{:?}` as equally harmful; a guard
-        // must not be narrower than the hazard its own neighbours describe.
-        // `{:#?}` contains neither of the other two as a substring, so all three
-        // are listed.
+        // The alternate render prints every cause verbatim. So does the debug
+        // render, which ALSO spans lines -- it is simultaneously the credential
+        // leak and the forged second line that
+        // `error_for_log_never_emits_a_forged_second_line` exists to prevent. An
+        // earlier revision blocked only the alternate one, while the comment at the
+        // preflight site named debug as equally harmful; a guard must not be
+        // narrower than the hazard its own neighbours describe.
+        //
+        // MATCH THE CLOSING FORM, NOT THE WHOLE PLACEHOLDER. Rust's inline capture
+        // writes the argument inside the braces -- `{e:#}`, not `{:#}` -- so the
+        // earlier list of whole placeholders could not see it. Measured: appending
+        // `{e:#}` to a site whose allowlist entry matches by PREFIX left this guard
+        // GREEN. The runtime integration test did catch that particular case, but
+        // this guard exists for the faults the runtime tests cannot see, so being
+        // covered there is luck rather than design. `{e:#}` is also the exact form
+        // that reached a live surface in `diagnose`.
+        //
+        // The three closing forms are listed separately because none contains
+        // another as a substring.
         for (line_no, body) in &sites {
-            for spec in ["{:#}", "{:?}", "{:#?}"] {
-                assert!(
-                    !body.contains(spec),
-                    "line {line_no} uses `{spec}`, which prints every cause \
-                     verbatim: {body}"
+            if let Some(spec) = alternate_or_debug_render(body) {
+                panic!(
+                    "line {line_no} uses an alternate/debug render ending `{spec}`, \
+                     which prints every cause verbatim. This matches the inline \
+                     capture form (`{{e:#}}`) as well as the bare one (`{{:#}}`): \
+                     {body}"
                 );
             }
         }
@@ -2185,6 +2346,23 @@ mod tests {
     /// fail-OPEN, and a `'('` char literal was measured doing exactly that --
     /// inflating the depth, running to EOF, and dropping the site while the total
     /// stayed inside a minimum-count floor.
+    /// The alternate or debug render specs, matched by their CLOSING form so the
+    /// inline-capture spelling is covered. Returns the spec that matched.
+    ///
+    /// WHAT THIS DOES NOT CATCH, stated because a guard that hides its edges
+    /// invites someone to trust it past them: a fill or align character before the
+    /// flag (`{e:>#}`) defeats it, as it defeated the whole-placeholder list this
+    /// replaced. That form appears nowhere in the corpus and closing it needs a
+    /// real parse of the format spec rather than a substring, so it is recorded
+    /// rather than half-handled. Tracing's `?field` Debug shorthand is a different
+    /// mechanism again and is not a format spec at all; there are no such sites in
+    /// what this guard covers.
+    fn alternate_or_debug_render(body: &str) -> Option<&'static str> {
+        [":#}", ":?}", ":#?}"]
+            .into_iter()
+            .find(|spec| body.contains(spec))
+    }
+
     fn warning_call_sites(src: &str) -> Vec<(usize, String)> {
         let bytes = src.as_bytes();
         let mut out = Vec::new();
