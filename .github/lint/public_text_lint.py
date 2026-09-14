@@ -121,17 +121,18 @@ def scan(message: str, source: str, rules: dict) -> list[Finding]:
         cleaned, rules["documentation_addresses"]["prefixes"]
     )
 
-    glob_rules = set(rules.get("glob_exemption", {}).get("applies_to", []))
-
     findings: list[Finding] = []
     for rule in rules["rules"]:
         # finditer, not search: report every occurrence. One message with four
         # private addresses should cost one fix, not four red runs.
         for match in rule["compiled"].finditer(cleaned):
-            if rule["id"] in glob_rules and _token_has_glob(cleaned, match.start()):
-                # A discovery-path TEMPLATE, not a location. The glob sits AFTER
-                # the matched span, so this looks at the surrounding token rather
-                # than the match -- checking the match alone would never see it.
+            if (
+                rule["id"] == "tilde-checkout-path"
+                and _whole_token(cleaned, match.start())
+                in rules["template_allowlist"]["tokens"]
+            ):
+                # Exact whole-token equality exempts only this occurrence.
+                # Unlisted punctuation, suffixes and quotes are not normalised.
                 continue
             line_no = cleaned.count("\n", 0, match.start()) + 1
             findings.append(
@@ -175,15 +176,15 @@ def _apply_precedence(findings: list[Finding], rules: dict) -> list[Finding]:
     return kept
 
 
-def _token_has_glob(text: str, index: int) -> bool:
-    """Does the whitespace-delimited token containing `index` hold a `*`?"""
+def _whole_token(text: str, index: int) -> str:
+    """Return the whitespace-delimited token verbatim, including punctuation."""
     start = index
     while start > 0 and not text[start - 1].isspace():
         start -= 1
     end = index
     while end < len(text) and not text[end].isspace():
         end += 1
-    return "*" in text[start:end]
+    return text[start:end]
 
 
 def commit_messages(base: str, head: str) -> list[tuple[str, str]]:
@@ -270,12 +271,23 @@ SELFTEST_CASES = [
     ("nic 0a1b.2c3d.4e5f flapped", "mac-address"),
     ("built in ${HOME}/coding/thing", "tilde-checkout-path"),
     ("moved /home//someone/project/file.rs", "absolute-home-path"),
-    # The glob exemption must NOT reach a home path: in /home/<user>/ the matched
-    # span IS the identity, and a glob later in the path cannot change that. A
-    # review found the first version suppressed a real username here, in prose as
-    # ordinary as cleaning up a cache directory.
+    # Absolute-home-path findings remain unaffected by template membership.
     ("moved /home/realuser/project* to storage", "absolute-home-path"),
     ("cleaned up /home/someone/.cache/thing-* before rebuilding", "absolute-home-path"),
+    # The suppression found in review, paired with its no-glob control.
+    ("cleaned ~/mathew/backups/old-project-*", "tilde-checkout-path"),
+    ("cleaned ~/mathew/backups/old-project", "tilde-checkout-path"),
+    # Synthetic and not allowlisted; the heuristic that exempted it is gone.
+    ("fix: probe ~/vendor/product-*/bin for the tool", "tilde-checkout-path"),
+    # Different tokens: no suffix, wildcard, punctuation or quote normalisation.
+    ("probe ~/elastic/elastic-agent-*/mathew", "tilde-checkout-path"),
+    ("probe ~/elastic/elastic-agent-*/),host", "tilde-checkout-path"),
+    ("probe ~/elastic/elastic-agent-**/", "tilde-checkout-path"),
+    ("probe ~/elastic/elastic-agent-*/).", "tilde-checkout-path"),
+    ("probe ~/elastic/elastic-agent-*/)", "tilde-checkout-path"),
+    ('probe "~/elastic/elastic-agent-*/),"', "tilde-checkout-path"),
+    ("probe '~/elastic/elastic-agent-*/'", "tilde-checkout-path"),
+    ("probe prefix~/elastic/elastic-agent-*/", "tilde-checkout-path"),
 ]
 
 SELFTEST_CLEAN = [
@@ -283,12 +295,11 @@ SELFTEST_CLEAN = [
     "Co-Authored-By: Someone <someone@example.com>\n",
     "docs: cite the reserved example address 192.0.2.254 in a doc comment\n",
     "test: cover the 2001:db8::1 documentation prefix\n",
-    # A glob is a discovery TEMPLATE and names nothing. Real false positive on a
-    # real commit, found by running against history rather than fixtures.
+    # Generic agent-discovery template's clean spelling: exact listed token.
     "fix: search ~/elastic/elastic-agent-*/ for the binary\n",
-    # The tilde form keeps the exemption: `~` already denotes the current user, so
-    # the segment after it is a directory name and carries no identity.
-    "fix: probe ~/vendor/product-*/bin for the tool\n",
+    # Historical token at 1d5ac56, including punctuation; the clean entry does
+    # not cover this distinct spelling under exact whole-token equality.
+    "(env -> PATH -> /opt/Elastic/Agent -> ~/elastic/elastic-agent-*/), registry",
     # A message ending in a blank line leaves paragraphs[-1] empty; the real
     # trailer is one element back and must still be exempted.
     "fix: something\n\nCo-Authored-By: Someone <someone@example.com>\n\n",
@@ -321,12 +332,35 @@ def selftest(rules: dict) -> int:
                 f"{sorted(set(found))}"
             )
             failures += 1
+    # For both permitted tokens, adding one to a message must preserve ALL
+    # findings from the separate tokens, including every other rule. Comparing
+    # lists also catches a spurious finding on the allowed token itself.
+    for template in ("~/elastic/elastic-agent-*/", "~/elastic/elastic-agent-*/),"):
+        for text, _ in SELFTEST_CASES:
+            expected = scan(text, "selftest", rules)
+            found = scan(f"{text}\t{template}", "selftest", rules)
+            if found != expected:
+                print("SELFTEST FAIL: a listed token changed separate findings")
+                failures += 1
+        # This synthetic rule deliberately matches the allowed token itself:
+        # exemption membership must never suppress a different rule's match.
+        other_rules = dict(rules)
+        other_rules["rules"] = [
+            {"id": "other-rule-control", "why": "selftest control",
+             "compiled": re.compile(re.escape(template))}
+        ]
+        if [f.rule_id for f in scan(template, "selftest", other_rules)] != [
+            "other-rule-control"
+        ]:
+            print("SELFTEST FAIL: template exemption reached another rule")
+            failures += 1
     if failures:
         print(f"public_text_lint selftest: {failures} failure(s)")
         return 1
     print(
         f"public_text_lint selftest: {len(SELFTEST_CASES)} seeded leaks caught, "
-        f"{len(SELFTEST_CLEAN)} clean messages passed"
+        f"{len(SELFTEST_CLEAN)} clean messages passed; "
+        f"{2 * len(SELFTEST_CASES)} mixed-message and 2 other-rule controls passed"
     )
     return 0
 
