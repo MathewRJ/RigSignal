@@ -1977,6 +1977,45 @@ mod tests {
         );
     }
 
+    /// The PREDICATE, against synthetic strings rather than today's corpus.
+    ///
+    /// Without this, the only exercise the match gets is the real file, so the day
+    /// the corpus stops containing a form is the day that form silently stops
+    /// being tested. The negative cases matter as much as the positive ones: this
+    /// predicate is a substring match and is much broader than the whole
+    /// placeholders it replaced.
+    #[test]
+    fn the_alternate_render_predicate_matches_every_spelling_and_no_width_spec() {
+        for caught in [
+            "\"x: {:#}\", e",
+            "\"x: {e:#}\"",
+            "\"x: {0:#}\", e",
+            "\"x: {name:#}\"",
+            "\"x: {:?}\", e",
+            "\"x: {e:?}\"",
+            "\"x: {:#?}\", e",
+            "\"x: {e:#?}\"",
+        ] {
+            assert!(
+                alternate_or_debug_render(caught).is_some(),
+                "not caught: {caught}"
+            );
+        }
+        for allowed in [
+            "\"plain {}\", e",
+            "\"width {:>8}\", n",
+            "\"precision {:.3}\", f",
+            "\"named {name}\"",
+            "\"hex {:#x}\", n",
+            "%error, \"structured field\"",
+        ] {
+            assert!(
+                alternate_or_debug_render(allowed).is_none(),
+                "false positive: {allowed}"
+            );
+        }
+    }
+
     /// The SCANNER itself, against a corpus built to contain what the real file
     /// does not.
     ///
@@ -2232,20 +2271,32 @@ mod tests {
         );
 
         // ── No alternate error formatting, at ANY position ───────────────────
-        // `{:#}` prints every cause verbatim. So does `{:?}`, which ALSO spans
-        // lines -- it is simultaneously the credential leak and the forged
-        // second line that `error_for_log_never_emits_a_forged_second_line`
-        // exists to prevent. The previous revision blocked only `{:#}`, while the
-        // comment at the preflight site named `{:?}` as equally harmful; a guard
-        // must not be narrower than the hazard its own neighbours describe.
-        // `{:#?}` contains neither of the other two as a substring, so all three
-        // are listed.
+        // The alternate render prints every cause verbatim. So does the debug
+        // render, which ALSO spans lines -- it is simultaneously the credential
+        // leak and the forged second line that
+        // `error_for_log_never_emits_a_forged_second_line` exists to prevent. An
+        // earlier revision blocked only the alternate one, while the comment at the
+        // preflight site named debug as equally harmful; a guard must not be
+        // narrower than the hazard its own neighbours describe.
+        //
+        // MATCH THE CLOSING FORM, NOT THE WHOLE PLACEHOLDER. Rust's inline capture
+        // writes the argument inside the braces -- `{e:#}`, not `{:#}` -- so the
+        // earlier list of whole placeholders could not see it. Measured: appending
+        // `{e:#}` to a site whose allowlist entry matches by PREFIX left this guard
+        // GREEN. The runtime integration test did catch that particular case, but
+        // this guard exists for the faults the runtime tests cannot see, so being
+        // covered there is luck rather than design. `{e:#}` is also the exact form
+        // that reached a live surface in `diagnose`.
+        //
+        // The three closing forms are listed separately because none contains
+        // another as a substring.
         for (line_no, body) in &sites {
-            for spec in ["{:#}", "{:?}", "{:#?}"] {
-                assert!(
-                    !body.contains(spec),
-                    "line {line_no} uses `{spec}`, which prints every cause \
-                     verbatim: {body}"
+            if let Some(spec) = alternate_or_debug_render(body) {
+                panic!(
+                    "line {line_no} uses an alternate/debug render ending `{spec}`, \
+                     which prints every cause verbatim. This matches the inline \
+                     capture form (`{{e:#}}`) as well as the bare one (`{{:#}}`): \
+                     {body}"
                 );
             }
         }
@@ -2295,6 +2346,23 @@ mod tests {
     /// fail-OPEN, and a `'('` char literal was measured doing exactly that --
     /// inflating the depth, running to EOF, and dropping the site while the total
     /// stayed inside a minimum-count floor.
+    /// The alternate or debug render specs, matched by their CLOSING form so the
+    /// inline-capture spelling is covered. Returns the spec that matched.
+    ///
+    /// WHAT THIS DOES NOT CATCH, stated because a guard that hides its edges
+    /// invites someone to trust it past them: a fill or align character before the
+    /// flag (`{e:>#}`) defeats it, as it defeated the whole-placeholder list this
+    /// replaced. That form appears nowhere in the corpus and closing it needs a
+    /// real parse of the format spec rather than a substring, so it is recorded
+    /// rather than half-handled. Tracing's `?field` Debug shorthand is a different
+    /// mechanism again and is not a format spec at all; there are no such sites in
+    /// what this guard covers.
+    fn alternate_or_debug_render(body: &str) -> Option<&'static str> {
+        [":#}", ":?}", ":#?}"]
+            .into_iter()
+            .find(|spec| body.contains(spec))
+    }
+
     fn warning_call_sites(src: &str) -> Vec<(usize, String)> {
         let bytes = src.as_bytes();
         let mut out = Vec::new();
