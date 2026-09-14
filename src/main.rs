@@ -2080,12 +2080,24 @@ mod tests {
         // THIS IS A WAIVER LIST, NOT A PROOF, and the name says so because the
         // previous revision called it STATIC_OUTERMOST_CONTEXT and asserted that
         // every entry's outermost layer was a static literal. A non-author review
-        // falsified that for ALL SEVEN entries: `shipper::ping`, `ship_documents`
-        // and `trigger_transform_sync` each call `build_client(config)?` with a
-        // bare `?`, so a CA-cert read failure makes
+        // falsified that for EVERY entry in the list below, by two distinct routes.
+        // (The phrase used to say "all seven". The list was seven entries when that
+        // was written and is eight now, so the number is deliberately gone rather
+        // than bumped: a count restated in prose beside a compiler-checked array
+        // goes stale silently, and this one did.)
+        //
+        // ROUTE ONE IS NOW CLOSED: `shipper::ping`, `ship_documents` and
+        // `trigger_transform_sync` each called `build_client(config)?` with a bare
+        // `?`, so a CA-cert read failure made
         // `format!("reading Elasticsearch CA cert: {}", path.display())` the
-        // outermost layer; the remote_connections entries resolve into
-        // path-interpolating contexts the same way.
+        // outermost layer. `build_client` now wraps its own body in a static
+        // context, so that path no longer surfaces at a `{}` render. It is still
+        // present in the DEEPER layers, so `{:#}` or `{:?}` would reach it.
+        //
+        // ROUTE TWO REMAINS OPEN: the remote_connections entries resolve into
+        // path-interpolating contexts of their own (many `with_context(|| format!
+        // ("... {}", path.display()))` sites in that file), and closing route one
+        // did nothing for them.
         //
         // Nothing here checks a row. A row that claims more than it can show turns
         // a live leak into a documented exemption, which is worse than no row --
