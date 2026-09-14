@@ -822,7 +822,22 @@ fn unix_millis() -> Result<u128> {
         .as_millis())
 }
 
+/// Build the Elasticsearch HTTP client.
+///
+/// The OUTERMOST error layer here is deliberately a static literal. Every caller
+/// uses a bare `?`, so this function's outermost layer is what a `{}` render puts
+/// in the journal -- and the inner CA-cert failure interpolates a filesystem path.
+/// Wrapping once here fixes all three call sites at once; fixing it at the call
+/// sites would have to be repeated for every future caller and silently missed.
+///
+/// This is a PATH disclosure, not a credential one: the path is operator-supplied
+/// configuration, not a secret. The deeper layers still carry it, so a change from
+/// `{}` to `{:#}` or `{:?}` at a log site would reach it again.
 fn build_client(config: &Config) -> Result<Client> {
+    build_client_inner(config).context("building the Elasticsearch HTTP client")
+}
+
+fn build_client_inner(config: &Config) -> Result<Client> {
     let mut builder = Client::builder().timeout(std::time::Duration::from_secs(30));
     if let Some(path) = &config.elasticsearch.ca_cert {
         let pem = std::fs::read(path)
@@ -1164,6 +1179,26 @@ mod tests {
         assert!(build_client(&config).is_ok());
 
         fs::remove_file(ca_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn build_client_error_does_not_name_the_ca_path_at_the_outermost_layer() -> Result<()> {
+        // Callers use a bare `?` on build_client, so whatever this returns as its
+        // outermost layer is what a `{}` render puts in the journal.
+        let ca_path = temp_spool_dir("ca-absent-UNIQUEMARKER").with_extension("pem");
+        assert!(!ca_path.exists());
+
+        let mut config: Config =
+            toml::from_str("[elasticsearch]\nendpoint = 'https://example.test'\n")?;
+        config.elasticsearch.ca_cert = Some(ca_path.clone());
+
+        let err = build_client(&config).expect_err("absent CA file should fail");
+        let outermost = format!("{err}");
+        assert!(
+            !outermost.contains("UNIQUEMARKER"),
+            "the CA path reached the outermost error layer: {outermost}"
+        );
         Ok(())
     }
 
