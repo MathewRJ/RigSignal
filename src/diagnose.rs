@@ -131,16 +131,30 @@ pub async fn run(cfg: &Config, config_path: Option<&Path>, output: Option<&Path>
 
     // ── Elasticsearch ─────────────────────────────────────────────────────────
 
-    note!("pinging Elasticsearch at {}", cfg.elasticsearch.endpoint);
+    // `note!` is tracing::info! plus a report push, so this reaches the JOURNAL as
+    // well as the report. It is the same surface the startup preflight was fixed
+    // for, not a milder operator-only one.
+    note!("pinging Elasticsearch at {}", cfg.endpoint_for_display());
     let es_status = match shipper::ping(cfg).await {
         Ok(()) => {
             note!("ES ping OK");
             "REACHABLE".to_string()
         }
         Err(e) => {
-            let msg = format!("ES ping failed: {e:#}");
+            // NOT `{e:#}`. The alternate form renders the whole anyhow chain, and
+            // one of its middle layers is reqwest's own error, which embeds the
+            // FULL REQUEST URL -- query parameters included. Measured with a
+            // canary endpoint: `{e:#}` put `?api_key=<canary>` into both the
+            // report and the journal, even though the outermost context is static.
+            //
+            // The outermost layer is static and the DEEPEST layer is the cause the
+            // operator actually needs ("Connection refused", "certificate
+            // verify failed"); it is the layers in between that carry the request.
+            // So render those two and drop the middle.
+            let reason = ping_failure_reason(&e);
+            let msg = format!("ES ping failed: {reason}");
             note!("{msg}");
-            format!("UNREACHABLE — {e:#}")
+            format!("UNREACHABLE — {reason}")
         }
     };
 
@@ -154,7 +168,7 @@ pub async fn run(cfg: &Config, config_path: Option<&Path>, output: Option<&Path>
     };
 
     writeln!(report, "Elasticsearch")?;
-    writeln!(report, "  Endpoint:   {}", cfg.elasticsearch.endpoint)?;
+    writeln!(report, "  Endpoint:   {}", cfg.endpoint_for_display())?;
     writeln!(report, "  Status:     {es_status}")?;
     writeln!(report, "  Auth:       {auth_kind}")?;
     writeln!(report)?;
@@ -215,4 +229,30 @@ pub async fn run(cfg: &Config, config_path: Option<&Path>, output: Option<&Path>
 /// Mirrors `home_dir()` used by `config.rs` without an extra dep.
 fn dirs_next_home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Render an ES ping failure as `<outermost>: <root cause>`, skipping the middle
+/// of the chain.
+///
+/// The middle layers are where the request detail lives -- reqwest's error
+/// Displays the full URL it was given, query string and all -- while the two ends
+/// are the parts an operator reads: what we were doing, and why it failed.
+///
+/// This is a REDUCTION, not a scrub: nothing is pattern-matched out of a string.
+/// If a future error type puts a URL in its ROOT cause, this would not stop it, so
+/// the regression test drives a real credential-bearing endpoint end to end rather
+/// than asserting on this function alone.
+fn ping_failure_reason(error: &anyhow::Error) -> String {
+    let outermost = error.to_string();
+    match error.chain().skip(1).last() {
+        Some(root) => {
+            let root = root.to_string();
+            if root == outermost {
+                outermost
+            } else {
+                format!("{outermost}: {root}")
+            }
+        }
+        None => outermost,
+    }
 }
