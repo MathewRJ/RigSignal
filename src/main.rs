@@ -2703,6 +2703,31 @@ mod tests {
         assert_production_render_is_guarded(source);
     }
 
+    #[test]
+    fn nested_block_comment_does_not_hide_following_production_render() {
+        let source = concat!(
+            "fn review_render(e: &anyhow::Error) -> String {\n",
+            "    /* outer /* inner */ still comment \" */\n",
+            "    let _ = \"/*\";\n",
+            "    format!(\"{e:#}\")\n",
+            "}\n",
+        );
+        assert_production_render_is_guarded(source);
+    }
+
+    #[test]
+    fn byte_char_literals_do_not_hide_following_production_render() {
+        for literal in ["b'\"'", "b'\\''"] {
+            // The byte-prefix branch has its own contract: scanning from the
+            // apostrophe can otherwise mask a broken scan from the prefix.
+            assert_eq!(char_literal_end(literal, 0), Some(literal.len()));
+            let source = format!(
+                "fn review_render(e: &anyhow::Error) -> String {{\n    let _ = {literal};\n    let _ = \"/*\";\n    format!(\"{{e:#}}\")\n}}\n"
+            );
+            assert_production_render_is_guarded(&source);
+        }
+    }
+
     /// The PREDICATE, against synthetic strings rather than today's corpus.
     ///
     /// Without this, the only exercise the match gets is the real file, so the day
