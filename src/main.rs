@@ -1655,8 +1655,11 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
 /// relied on. It is NOT a claim that a syscall produced the value:
 /// `from_raw_os_error` lets a caller choose the number. Choosing a misleading
 /// errno is a far smaller problem than echoing an arbitrary string, which is the
-/// trade this makes. When no OS error is in the chain, ordinary text stays
-/// byte-identical to the previous `{}` behaviour.
+/// trade this makes. When no OS error is in the chain, text with no control,
+/// separator, bidi or backslash character stays byte-identical to the previous
+/// `{}` behaviour. A backslash is doubled, so a Windows path logs as
+/// `C:\\ProgramData\\...`: that is what keeps a real line break (`\n`, two
+/// characters) distinguishable from the literal text `\n` (three).
 fn error_for_log(err: &anyhow::Error) -> String {
     let outer_message = err.to_string();
     let outer = log_safe::escape_for_log(&outer_message);

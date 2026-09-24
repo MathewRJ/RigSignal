@@ -1168,6 +1168,20 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    /// The per-item bulk error is logged through `serde_json::Value`'s Display,
+    /// which serialises the value as JSON: a line break inside the server's
+    /// reason string is written as the two characters `\n`, never a raw one.
+    /// Pinned here because the site is not routed through escape_for_log. JSON
+    /// does NOT escape U+0085 or U+2028/U+2029; those are not line breaks to
+    /// journald, and are recorded as a residual rather than claimed covered.
+    #[test]
+    fn bulk_item_error_display_does_not_forge_log_lines() {
+        let err = json!({"type": "mapper_parsing_exception", "reason": "ok\r\nFORGED line"});
+        let line = format!("bulk item error: {}", err);
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        assert!(line.contains("ok\\r\\nFORGED"));
+    }
+
     #[test]
     fn ping_failure_message_does_not_forge_log_lines() {
         let status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
