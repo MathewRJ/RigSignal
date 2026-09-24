@@ -42,6 +42,13 @@ struct LockRetryFailure {
 
 /// There are eight attempts and seven gaps between them. The next (640 ms)
 /// backoff would follow the final attempt, so it is never slept.
+///
+/// The sleep is `std::thread::sleep`, and SpoolWriter::new is called from the
+/// async `run()` at startup, so a contended start blocks one runtime worker
+/// thread for at most the 635 ms of waits (the 2 s cap is the backstop). That
+/// is accepted: it happens once, before any collector or shipping task is
+/// spawned, and the only alternative, spawn_blocking, would move the lock file
+/// across threads for no gain in a phase with nothing else to schedule.
 fn try_spool_lock_with_retry(
     mut try_lock: impl FnMut() -> std::io::Result<()>,
     mut elapsed: impl FnMut() -> Duration,
