@@ -2609,6 +2609,57 @@ mod tests {
         );
     }
 
+    /// Exercise the same preprocessing and line predicate as the tree-wide guard.
+    /// Both observations matter: a missing line makes the verdict vacuously safe.
+    fn assert_production_render_is_guarded(source: &str) {
+        let render = "format!(\"{e:#}\")";
+        assert!(source.lines().any(|line| line.trim() == render));
+        let preprocessed = strip_comments(&production_region(source));
+        let retained = preprocessed.lines().any(|line| line.trim() == render);
+        let flagged = preprocessed
+            .lines()
+            .any(|line| [":#}", ":#?}"].iter().any(|spec| line.contains(spec)));
+        assert_eq!(
+            (retained, flagged),
+            (true, true),
+            "production render must survive preprocessing and trigger the guard:\n{preprocessed}"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_test_module_does_not_hide_following_production_render() {
+        let source = concat!(
+            "#[cfg(test)]\n",
+            "mod review_empty;\n",
+            "fn review_render(e: &anyhow::Error) -> String {\n",
+            "    format!(\"{e:#}\")\n",
+            "}\n",
+        );
+        assert_production_render_is_guarded(source);
+    }
+
+    #[test]
+    fn raw_string_comment_text_does_not_hide_following_production_render() {
+        let source = concat!(
+            "fn review_render(e: &anyhow::Error) -> String {\n",
+            "    let _ = r#\"quoted \" /* ordinary raw-string contents\"#;\n",
+            "    format!(\"{e:#}\")\n",
+            "}\n",
+        );
+        assert_production_render_is_guarded(source);
+    }
+
+    #[test]
+    fn raw_c_string_comment_text_does_not_hide_following_production_render() {
+        let source = concat!(
+            "fn review_render(e: &anyhow::Error) -> String {\n",
+            "    let _ = cr#\"quoted \" /* ordinary C-string contents\"#;\n",
+            "    format!(\"{e:#}\")\n",
+            "}\n",
+        );
+        assert_production_render_is_guarded(source);
+    }
+
     /// The PREDICATE, against synthetic strings rather than today's corpus.
     ///
     /// Without this, the only exercise the match gets is the real file, so the day
