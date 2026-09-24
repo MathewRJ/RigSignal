@@ -30,6 +30,69 @@ const RETENTION_SCAN_BATCH: usize = 1_000;
 const RECOVERY_MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Elastic Agent filestream ignores files smaller than this fingerprint window.
 const MIN_PUBLISHED_SPOOL_BYTES: u64 = 1024;
+const SPOOL_LOCK_RETRY_CAP: Duration = Duration::from_secs(2);
+const SPOOL_LOCK_BACKOFF_MS: [u64; 7] = [5, 10, 20, 40, 80, 160, 320];
+
+struct LockRetryFailure {
+    error: std::io::Error,
+    attempts: usize,
+    elapsed: Duration,
+    exhausted: bool,
+}
+
+/// There are eight attempts and seven gaps between them. The next (640 ms)
+/// backoff would follow the final attempt, so it is never slept.
+///
+/// The sleep is `std::thread::sleep`, and SpoolWriter::new is called from the
+/// async `run()` at startup, so a contended start blocks one runtime worker
+/// thread for at most the 635 ms of waits (the 2 s cap is the backstop). That
+/// is accepted: it happens once, before any collector or shipping task is
+/// spawned, and the only alternative, spawn_blocking, would move the lock file
+/// across threads for no gain in a phase with nothing else to schedule.
+fn try_spool_lock_with_retry(
+    mut try_lock: impl FnMut() -> std::io::Result<()>,
+    mut elapsed: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+    backoffs: &[Duration],
+    cap: Duration,
+) -> std::result::Result<(), LockRetryFailure> {
+    let contended_code = fs2::lock_contended_error().raw_os_error();
+    for attempt in 1..=backoffs.len() + 1 {
+        match try_lock() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = contended_code.is_some() && error.raw_os_error() == contended_code;
+                if !retryable || attempt > backoffs.len() {
+                    return Err(LockRetryFailure {
+                        error,
+                        attempts: attempt,
+                        elapsed: elapsed(),
+                        exhausted: retryable,
+                    });
+                }
+                let remaining = cap.saturating_sub(elapsed());
+                if remaining.is_zero() {
+                    return Err(LockRetryFailure {
+                        error,
+                        attempts: attempt,
+                        elapsed: elapsed(),
+                        exhausted: true,
+                    });
+                }
+                sleep(backoffs[attempt - 1].min(remaining));
+                if elapsed() >= cap {
+                    return Err(LockRetryFailure {
+                        error,
+                        attempts: attempt,
+                        elapsed: elapsed(),
+                        exhausted: true,
+                    });
+                }
+            }
+        }
+    }
+    unreachable!("lock retry loop always returns")
+}
 
 pub struct ShipResult {
     pub attempted: usize,
@@ -85,12 +148,28 @@ impl SpoolWriter {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("opening spool lockfile: {}", lock_path.display()))?;
-        lock_file.try_lock_exclusive().with_context(|| {
-            format!(
+        let started = Instant::now();
+        let backoffs = SPOOL_LOCK_BACKOFF_MS.map(Duration::from_millis);
+        if let Err(failure) = try_spool_lock_with_retry(
+            || lock_file.try_lock_exclusive(),
+            || started.elapsed(),
+            std::thread::sleep,
+            &backoffs,
+            SPOOL_LOCK_RETRY_CAP,
+        ) {
+            let error = anyhow::Error::new(failure.error).context(format!(
                 "spool directory {} is already locked by another RigSignal agent",
                 dir.display()
-            )
-        })?;
+            ));
+            if failure.exhausted {
+                return Err(error.context(format!(
+                    "spool lock retry exhausted after {} attempts and {} ms",
+                    failure.attempts,
+                    failure.elapsed.as_millis()
+                )));
+            }
+            return Err(error);
+        }
 
         // DatasetSpool::new truncates active files, so recovery must complete
         // for every dataset before normal operation can create one.
@@ -1165,6 +1244,7 @@ fn transform_failure_message(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::Cell;
     use std::fs;
     use std::time::Duration;
 
@@ -1776,18 +1856,168 @@ mod tests {
     }
 
     #[test]
-    fn second_writer_for_a_spool_directory_fails_fast() -> Result<()> {
+    fn second_writer_exhausts_eight_nonblocking_attempts() -> Result<()> {
         let dir = temp_spool_dir("single-writer-lock");
         let writer = SpoolWriter::new(&dir, 0, 0, 72)?;
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(".rigsignal-spool.lock"))?;
+        let contention = probe
+            .try_lock_exclusive()
+            .expect_err("independent file handle must contend");
+        assert_eq!(
+            contention.raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        let started = Instant::now();
         let error = match SpoolWriter::new(&dir, 0, 0, 72) {
             Ok(_) => anyhow::bail!("second writer unexpectedly acquired the spool lock"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("already locked"));
+        assert!(error.to_string().contains("after 8 attempts"), "{error:#}");
+        assert!(started.elapsed() <= SPOOL_LOCK_RETRY_CAP + Duration::from_millis(500));
+        assert!(format!("{error:#}").contains("already locked"));
+        assert!(error.chain().any(|cause| cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == fs2::lock_contended_error().raw_os_error()));
 
+        drop(probe);
         drop(writer);
         fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn writer_acquires_lock_released_during_backoff() -> Result<()> {
+        let dir = temp_spool_dir("released-lock");
+        fs::create_dir_all(&dir)?;
+        let lock_path = dir.join(".rigsignal-spool.lock");
+        let holder = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        holder.try_lock_exclusive()?;
+        let probe = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+        assert_eq!(
+            probe
+                .try_lock_exclusive()
+                .expect_err("setup must contend")
+                .raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        drop(probe);
+        let (first_attempt, release_signal) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            release_signal.recv().expect("first lock attempt signal");
+            std::thread::sleep(Duration::from_millis(55));
+            drop(holder);
+        });
+        let started = Instant::now();
+        let attempts = Cell::new(0);
+        let backoffs = SPOOL_LOCK_BACKOFF_MS.map(Duration::from_millis);
+        let candidate = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+        try_spool_lock_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                let result = candidate.try_lock_exclusive();
+                if attempts.get() == 1 {
+                    first_attempt
+                        .send(())
+                        .expect("release thread still waiting");
+                }
+                result
+            },
+            || started.elapsed(),
+            std::thread::sleep,
+            &backoffs,
+            SPOOL_LOCK_RETRY_CAP,
+        )
+        .map_err(|failure| failure.error)?;
+        assert!(attempts.get() > 1);
+        release.join().expect("lock release thread panicked");
+        drop(candidate);
+        let writer = SpoolWriter::new(&dir, 0, 0, 72)?;
+        drop(writer);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn non_contention_error_has_one_attempt_and_no_sleep() {
+        let attempts = Cell::new(0);
+        let sleeps = Cell::new(0);
+        let failure = try_spool_lock_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            },
+            || Duration::ZERO,
+            |_| sleeps.set(sleeps.get() + 1),
+            &[Duration::from_millis(5)],
+            SPOOL_LOCK_RETRY_CAP,
+        )
+        .expect_err("permission error must fail");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(failure.attempts, 1);
+        assert!(!failure.exhausted);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn uncontended_lock_succeeds_on_first_attempt_without_sleep() -> Result<()> {
+        let dir = temp_spool_dir("uncontended-lock");
+        fs::create_dir_all(&dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join(".rigsignal-spool.lock"))?;
+        let attempts = Cell::new(0);
+        let sleeps = Cell::new(0);
+        try_spool_lock_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                file.try_lock_exclusive()
+            },
+            || Duration::ZERO,
+            |_| sleeps.set(sleeps.get() + 1),
+            &[Duration::from_millis(5)],
+            SPOOL_LOCK_RETRY_CAP,
+        )
+        .map_err(|failure| failure.error)?;
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+        drop(file);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn retry_sleep_never_crosses_the_cap() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let attempts = Cell::new(0);
+        let contended_code = fs2::lock_contended_error()
+            .raw_os_error()
+            .expect("OS contention code");
+        let failure = try_spool_lock_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from_raw_os_error(contended_code))
+            },
+            || elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+            &[Duration::from_millis(700); 3],
+            Duration::from_secs(1),
+        )
+        .expect_err("contended lock must fail");
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(elapsed.get(), Duration::from_secs(1));
+        assert_eq!(failure.elapsed, elapsed.get());
     }
 
     fn test_doc(dataset: &str, marker: &str) -> Value {
