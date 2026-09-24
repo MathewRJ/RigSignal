@@ -14,6 +14,11 @@ import tempfile
 from unittest.mock import patch
 
 
+# Only detect a hung worker; the deadline under test is the inner 0.05 s.
+# CPython test.support.SHORT_TIMEOUT uses 30 s for slow buildbots.
+WORKER_HANG_CEILING_SECS = 30.0
+
+
 def worker(driver, case):
     spec = importlib.util.spec_from_file_location('driver', driver)
     module = importlib.util.module_from_spec(spec)
@@ -203,6 +208,6 @@ if __name__ == '__main__':
     else:
         for case in sys.argv[2:] or ['fifo', 'status', 'output', 'result', 'traversal', 'output-fifo', 'result-fifo', 'stderr-full', 'real-expiry', 'expired-cleanup', 'partial-cleanup']:
             result = subprocess.run([sys.executable, __file__, '--worker', sys.argv[1], case],
-                                    capture_output=True, text=True, timeout=0.3)
+                                    capture_output=True, text=True, timeout=WORKER_HANG_CEILING_SECS)
             assert result.returncode == 0, result.stdout + result.stderr
             print(f'PASS: {case} reporting regression worker exit=0')
