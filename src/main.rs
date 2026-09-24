@@ -19,6 +19,7 @@ mod dllscan;
 mod handshake;
 mod host;
 mod launchers_windows;
+mod log_safe;
 mod profiles;
 #[cfg(target_os = "linux")]
 mod remote_connections;
@@ -1635,7 +1636,7 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
 
 /// Render an error for an operator log: the error's own message, plus the OS
 /// error code and its strerror text when one is anywhere in the cause chain,
-/// and nothing else.
+/// and nothing else. Controls in the outer message are escaped.
 ///
 /// Why this exists, and why it is not simply `{:#}`. On a full disk the spool
 /// warnings printed only `flushing spool writer` — the errno never reached the
@@ -1654,10 +1655,14 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
 /// relied on. It is NOT a claim that a syscall produced the value:
 /// `from_raw_os_error` lets a caller choose the number. Choosing a misleading
 /// errno is a far smaller problem than echoing an arbitrary string, which is the
-/// trade this makes. When no OS error is in the chain the output is
-/// byte-identical to the previous `{}` behaviour, so nothing that used to be
-/// logged stops being logged.
+/// trade this makes. When no OS error is in the chain, text with no control,
+/// separator, bidi or backslash character stays byte-identical to the previous
+/// `{}` behaviour. A backslash is doubled, so a Windows path logs as
+/// `C:\\ProgramData\\...`: that is what keeps a real line break (`\n`, two
+/// characters) distinguishable from the literal text `\n` (three).
 fn error_for_log(err: &anyhow::Error) -> String {
+    let outer_message = err.to_string();
+    let outer = log_safe::escape_for_log(&outer_message);
     for (depth, cause) in err.chain().enumerate() {
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
             if io_err.raw_os_error().is_some() {
@@ -1666,13 +1671,13 @@ fn error_for_log(err: &anyhow::Error) -> String {
                 // a failed removal of an empty replacement file propagates a bare
                 // io::Error with no context.
                 if depth == 0 {
-                    return format!("{err}");
+                    return outer.into_owned();
                 }
-                return format!("{err}: {io_err}");
+                return format!("{outer}: {io_err}");
             }
         }
     }
-    format!("{err}")
+    outer.into_owned()
 }
 
 #[cfg(test)]
@@ -3259,6 +3264,17 @@ mod tests {
             rendered,
             "flushing spool writer: No space left on device (os error 28)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_escapes_a_forged_line_in_the_outer_spool_path() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES))
+            .context("opening active spool file: /tmp/spool\nWARN rigsignal: FORGED.ndjson");
+        let rendered = error_for_log(&err);
+        assert!(!rendered.contains('\n'), "{rendered:?}");
+        assert!(rendered.contains("spool\\nWARN rigsignal: FORGED.ndjson"));
+        assert!(rendered.contains("Permission denied (os error 13)"));
     }
 
     /// An OS error nested deeper than the first cause is still found: the helper

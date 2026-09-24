@@ -929,11 +929,7 @@ pub async fn ping(config: &Config) -> Result<()> {
     // Only treat network-level failures as fatal; auth issues surface at bulk time.
     if status.is_server_error() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "ES ping returned {}: {}",
-            status,
-            &body[..body.len().min(200)]
-        );
+        anyhow::bail!("{}", ping_failure_message(status, &body));
     }
 
     if status.is_success() {
@@ -1003,11 +999,7 @@ pub async fn ship_documents(config: &Config, docs: Vec<ShipDocument>) -> Result<
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "ES bulk returned {}: {}",
-            status,
-            &text[..text.len().min(500)]
-        );
+        anyhow::bail!("{}", bulk_failure_message(status, &text));
     }
 
     let resp_body: Value = resp.json().await.context("parsing bulk response")?;
@@ -1129,17 +1121,44 @@ pub async fn trigger_transform_sync(config: &Config, transform_id: &str) -> Resu
     let resp = req.send().await.context("sending transform schedule_now")?;
     let status = resp.status();
     if status.is_success() {
-        debug!("transform '{}' schedule_now accepted", transform_id);
+        debug!(
+            "transform '{}' schedule_now accepted",
+            crate::log_safe::escape_for_log(transform_id)
+        );
     } else {
         let body = resp.text().await.unwrap_or_default();
-        warn!(
-            "transform '{}' schedule_now returned {}: {}",
-            transform_id,
-            status,
-            &body[..body.len().min(200)]
-        );
+        warn!("{}", transform_failure_message(transform_id, status, &body));
     }
     Ok(())
+}
+
+fn ping_failure_message(status: reqwest::StatusCode, body: &str) -> String {
+    format!(
+        "ES ping returned {}: {}",
+        status,
+        crate::log_safe::escape_for_log(crate::log_safe::truncate_chars(body, 200))
+    )
+}
+
+fn bulk_failure_message(status: reqwest::StatusCode, body: &str) -> String {
+    format!(
+        "ES bulk returned {}: {}",
+        status,
+        crate::log_safe::escape_for_log(crate::log_safe::truncate_chars(body, 500))
+    )
+}
+
+fn transform_failure_message(
+    transform_id: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> String {
+    format!(
+        "transform '{}' schedule_now returned {}: {}",
+        crate::log_safe::escape_for_log(transform_id),
+        status,
+        crate::log_safe::escape_for_log(crate::log_safe::truncate_chars(body, 200))
+    )
 }
 
 #[cfg(test)]
@@ -1148,6 +1167,49 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::time::Duration;
+
+    /// The per-item bulk error is logged through `serde_json::Value`'s Display,
+    /// which serialises the value as JSON: a line break inside the server's
+    /// reason string is written as the two characters `\n`, never a raw one.
+    /// Pinned here because the site is not routed through escape_for_log. JSON
+    /// does NOT escape U+0085 or U+2028/U+2029; those are not line breaks to
+    /// journald, and are recorded as a residual rather than claimed covered.
+    #[test]
+    fn bulk_item_error_display_does_not_forge_log_lines() {
+        let err = json!({"type": "mapper_parsing_exception", "reason": "ok\r\nFORGED line"});
+        let line = format!("bulk item error: {}", err);
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        assert!(line.contains("ok\\r\\nFORGED"));
+    }
+
+    #[test]
+    fn ping_failure_message_does_not_forge_log_lines() {
+        let status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+        let message = ping_failure_message(status, "ok\nFORGED line");
+        assert!(!message.contains('\n'), "{message:?}");
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
+    fn bulk_failure_message_does_not_forge_log_lines() {
+        let message = bulk_failure_message(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "ok\nFORGED line",
+        );
+        assert!(!message.contains('\n'), "{message:?}");
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
+    fn transform_failure_message_does_not_forge_log_lines() {
+        let message = transform_failure_message(
+            "id\nFORGED id",
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "ok\nFORGED line",
+        );
+        assert!(!message.contains('\n'), "{message:?}");
+        assert!(message.contains("\\n"));
+    }
 
     const CA_ONE: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBcTCCARegAwIBAgIUFcCd4QbbalB9vcqsIBvd3Tbhx7kwCgYIKoZIzj0EAwIw\nDjEMMAoGA1UEAwwDb25lMB4XDTI2MDczMTA4MDU0MloXDTI2MDgwMTA4MDU0Mlow\nDjEMMAoGA1UEAwwDb25lMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEBB9OC7xC\n6hGn6GNVbHVnsGwfmI0MJHSAiZDAjyHYn71C2EufTKa9yMy9EK53OEhSiOXTm8ob\nK3Z1F8FoTaUWa6NTMFEwHQYDVR0OBBYEFAiHcI/D49ZptsjDCKqSp8S+M5V+MB8G\nA1UdIwQYMBaAFAiHcI/D49ZptsjDCKqSp8S+M5V+MA8GA1UdEwEB/wQFMAMBAf8w\nCgYIKoZIzj0EAwIDSAAwRQIgSu9o44gWsyAvtbeXKuhIi4vUxSn6TU8N/SCPNVag\n5a0CIQD0jGGCQNjrdXYdp+Ai9qnxDgPWuP5S2f6YglCV2U2+LQ==\n-----END CERTIFICATE-----\n";
     const CA_TWO: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBcjCCARegAwIBAgIUQfddtbOce+qPSqLwrmjPDM7TXD0wCgYIKoZIzj0EAwIw\nDjEMMAoGA1UEAwwDdHdvMB4XDTI2MDczMTA4MDU0MloXDTI2MDgwMTA4MDU0Mlow\nDjEMMAoGA1UEAwwDdHdvMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEPTzsI0t3\nHnoK21Lj7cZyyvdk1j+1FTr1j4pFqAzj4fCmkzL6b5/DvDGd6W6/cNWsudThEd/W\n5weWjjQ/pkwsV6NTMFEwHQYDVR0OBBYEFDEX3FfU9i6bRINlvF3qv8Q3EjXZMB8G\nA1UdIwQYMBaAFDEX3FfU9i6bRINlvF3qv8Q3EjXZMA8GA1UdEwEB/wQFMAMBAf8w\nCgYIKoZIzj0EAwIDSQAwRgIhAPoTor2MMq2xCgXZ//ppUjVWMS0nguvbUWX8GFkz\neyyNAiEAmG6bMDUDTMtCc1a7VEdLeUHlJEpJb9sWDAouMyVfveQ=\n-----END CERTIFICATE-----\n";

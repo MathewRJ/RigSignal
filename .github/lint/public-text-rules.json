@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "purpose": "Text that ships in this public repository's history must not carry operator-environment detail. Commit messages and annotated tag messages are permanent and world-readable once pushed.",
+  "scope_note": "These rules cover GENERIC classes only. They deliberately do not encode any organisation-specific hostname, account name or internal identifier prefix, because a denylist of internal identifiers committed to a public repository publishes the shape of those identifiers to everyone who reads it. Checks for those belong in private tooling. This file's own contents are safe to publish, and that is a design constraint rather than an accident.",
+  "documentation_addresses": {
+    "why": "Reserved ranges that exist to be written down. Carved out ONCE, centrally, so that no two rules can reach opposite verdicts on the same address. This repository legitimately uses them in its own examples.",
+    "prefixes": [
+      "192.0.2.",
+      "198.51.100.",
+      "203.0.113.",
+      "233.252.0.",
+      "2001:db8:",
+      "2001:0db8:"
+    ]
+  },
+  "trailer_exemption": {
+    "why": "A mandated Co-Authored-By trailer carries an address, which would otherwise trip the host rule on nearly every commit. The exemption is deliberately narrow: only the ADDRESS PORTION of a well-formed trailer, only in the FINAL paragraph. An earlier implementation blanked the whole line for any key matching cc/author/committer anywhere in the message, which made `Author: <anything>` lint clean - and `Author:` is the first token you get when pasting git log output into a message.",
+    "keys": [
+      "Co-Authored-By",
+      "Signed-off-by",
+      "Reported-by",
+      "Reviewed-by",
+      "Tested-by",
+      "Acked-by",
+      "Helped-by",
+      "Suggested-by"
+    ]
+  },
+  "rules": [
+    {
+      "id": "session-trailer",
+      "pattern": "(?im)^[ \\t]*Claude-Session[ \\t]*:",
+      "why": "The session trailer belongs only on private repositories. It links a public commit to an internal transcript. (Matched with horizontal whitespace only: a `\\s*` here consumes the preceding newline and reports the wrong line.)",
+      "severity": "error"
+    },
+    {
+      "id": "session-url",
+      "pattern": "(?i)https?://claude\\.ai/code/\\S+",
+      "why": "A session URL is a direct pointer into private conversation history.",
+      "severity": "error"
+    },
+    {
+      "id": "session-id",
+      "pattern": "(?<![A-Za-z0-9_])session_[A-Za-z0-9]{16,}",
+      "why": "A bare session identifier is the same disclosure as the URL without the scheme.",
+      "severity": "error"
+    },
+    {
+      "id": "private-ipv4",
+      "pattern": "(?<![0-9.])(?:10\\.(?:[0-9]{1,3}\\.){2}[0-9]{1,3}|192\\.168\\.[0-9]{1,3}\\.[0-9]{1,3}|172\\.(?:1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3}|100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]{1,3}\\.[0-9]{1,3})(?![0-9]|\\.[0-9])",
+      "why": "RFC 1918 and RFC 6598 addresses describe someone's internal network topology.",
+      "severity": "error"
+    },
+    {
+      "id": "absolute-home-path",
+      "pattern": "(?<![A-Za-z0-9_./~-])(?:/home/+[A-Za-z0-9._-]+/|/root/)",
+      "why": "An absolute home path names a local account and the layout of a machine that is not this repository.",
+      "severity": "error"
+    },
+    {
+      "id": "tilde-checkout-path",
+      "pattern": "(?:~|\\$HOME|\\$\\{HOME\\})/(?!\\.)[A-Za-z0-9_-][A-Za-z0-9._-]*/",
+      "why": "A personal checkout path describes a working environment rather than the code; refer to paths relative to the repository root. Dotfile-rooted paths such as ~/.local or ~/.config are deliberately NOT matched: they are standard locations that name neither a user nor a machine, and an earlier revision of this rule produced a false positive on ~/.local/bin in a real tag message. The braced ${HOME} form is matched too. Only exact equality of the entire whitespace-delimited token with a template_allowlist entry exempts this rule's occurrence. Only the historically observed punctuated token is permitted; unlisted punctuation, suffix or quote variants are not exempt. No substring, prefix, glob expansion or normalisation applies, and no whole line or other rule is exempted. The documented known_gaps are unchanged.",
+      "severity": "error"
+    },
+    {
+      "id": "worktree-path",
+      "pattern": "(?<![A-Za-z0-9_./-])worktrees?/[A-Za-z0-9._-]+",
+      "why": "A worktree name is local scaffolding and means nothing to a reader of this repository.",
+      "severity": "error"
+    },
+    {
+      "id": "user-at-ip-literal",
+      "pattern": "(?<![A-Za-z0-9_.+-])[A-Za-z0-9._+-]+@(?:(?<![0-9.])(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?![0-9.])|\\[[0-9A-Fa-f:]+\\])",
+      "why": "A login paired with an address is a credential-shaped hint about a specific machine. Bounded to IP literals on purpose: a bare hostname cannot be distinguished from an ordinary email domain without naming the organisation's hosts, which this file must not do.",
+      "severity": "error"
+    },
+    {
+      "id": "mac-address",
+      "pattern": "(?<![0-9A-Fa-f:.-])(?:(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}|(?:[0-9A-Fa-f]{4}\\.){2}[0-9A-Fa-f]{4})(?![0-9A-Fa-f:-]|\\.[0-9A-Fa-f])",
+      "why": "A MAC address identifies one physical interface and is stable for the life of the hardware. Colon, dash and Cisco dotted-triplet notations are all matched: the dash form is the Windows getmac default, so it is the likely accidental paste rather than an adversarial one.",
+      "severity": "error"
+    },
+    {
+      "id": "private-ipv6",
+      "pattern": "(?<![0-9A-Za-z_:])(?:[fF][cCdD]|[fF][eE]80)[0-9A-Fa-f:]*(?![0-9A-Za-z_:])",
+      "why": "IPv6 unique-local and link-local addresses describe an internal network. A link-local address derived from a MAC also outlives the interface it names.",
+      "severity": "error"
+    }
+  ],
+  "finding_precedence": {
+    "why": "A session trailer line also matches the URL and bare-id rules, so an unsuppressed scan reports three findings for one problem. Three findings for one problem trains a reader to skim, which is how a fourth, real finding gets missed.",
+    "suppressed_by": {
+      "session-trailer": [
+        "session-url",
+        "session-id"
+      ]
+    }
+  },
+  "template_allowlist": {
+    "why": "Only tilde-checkout-path occurrences whose entire whitespace-delimited token exactly equals a listed string are exempt. No substring, prefix, glob expansion or normalisation applies: unlisted punctuation, suffix and quote variants are different strings and are not exempt. Only the punctuated historical token at 1d5ac56 is permitted. This never exempts a whole line or another rule; all documented known_gaps remain unchanged.",
+    "tokens": [
+      "~/elastic/elastic-agent-*/),"
+    ],
+    "historical_token_why": "The token is the actual historical token at commit 1d5ac56, whose message reads (env -> PATH -> /opt/Elastic/Agent -> ~/elastic/elastic-agent-*/), registry. Its attached punctuation makes it distinct: exact equality with the clean spelling does not cover it."
+  },
+  "known_gaps": {
+    "why": "Stated so a pass is not read as more than it is. A reviewer graded each of these for whether it arises by ACCIDENT (which this gate should catch) or only by INTENT (which a commit-message lint cannot usefully defend against, since the same author controls the text). Two were promoted from adversarial to ordinary-use by that review and are recorded here rather than silently kept out.",
+    "gaps": [
+      {
+        "id": "line-split-address",
+        "arises": "by accident",
+        "note": "An ordinary 72-column body wrap can break inside a line containing an address. Mechanical, not chosen. The reviewer's strongest disagreement with treating it as adversarial. NOT handled: joining lines before scanning risks fusing unrelated tokens, so it needs a design decision rather than a quick patch."
+      },
+      {
+        "id": "fullwidth-unicode-digits",
+        "arises": "by accident",
+        "note": "A CJK IME left in fullwidth mode is a documented accidental-input class. NOT handled: needs Unicode normalisation before matching, which widens the blast radius of every rule."
+      },
+      {
+        "id": "percent-encoded-forms",
+        "arises": "sometimes by accident",
+        "note": "Pasting an already-encoded URL or log line is plausible for the session-url and path forms; a hand-typed percent-encoded bare address in prose is not. Split verdict: the URL/path sub-case is ordinary, the bare-address sub-case adversarial."
+      },
+      {
+        "id": "decimal-hex-octal-ipv4",
+        "arises": "mostly by intent",
+        "note": "The accidental route is pasting raw output from a tool that renders addresses as integers. Real but narrow for this project's toolchain. Lowest priority."
+      },
+      {
+        "id": "cidr-class-names",
+        "arises": "by accident",
+        "note": "Prose that names the unique-local or link-local block in CIDR notation (the block's first address followed by a prefix length) is refused as a private-ipv6 finding, because the first address of each block is itself a member of that block. Rewrite the prose in words. NOT handled: exempting a trailing prefix length would also exempt a real address written with one."
+      }
+    ]
+  }
+}
