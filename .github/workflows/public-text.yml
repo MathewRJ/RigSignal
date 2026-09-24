@@ -1,0 +1,226 @@
+name: public-text
+
+# This repository is public and its history is permanent. Commit and annotated
+# tag messages must not carry operator-environment detail.
+#
+# The job runs UNCONDITIONALLY. It does not ask the API whether the repository
+# is public and branch on the answer: a check that decides whether to check is
+# a check that can decide not to, and the failure mode is silent.
+#
+# Rules live in .github/lint/public-text-rules.json, which is the single source
+# of truth so that private tooling can consume the same file rather than keep a
+# second copy that drifts.
+#
+# SCOPE, stated here so a green run is not read as more than it is: this covers
+# GENERIC classes only — session identifiers, private addresses, home and
+# checkout paths, MAC addresses, logins paired with IP literals. It does NOT
+# cover organisation-specific hostnames or internal identifier prefixes, because
+# a denylist of those committed to a public repository would publish exactly the
+# naming it exists to keep out. Those checks belong in private tooling.
+#
+# KNOWN GAPS, declared here and in `known_gaps` in the rules file. They are
+# deliberately NOT printed in the per-run failure output: that reaches every
+# author who trips the gate, and listing the blind spots on every failure
+# republishes them far wider than the people evaluating the gate. A reviewer or
+# an owner reads this header; a tripped author does not need it.
+#
+# Each was graded for whether it arises BY ACCIDENT — which this gate should
+# catch — or only BY INTENT, which a commit-message lint cannot usefully defend
+# against, since the same author controls the text:
+#
+#   line-split-address        by accident        a body wrap can break inside a
+#                                                line containing an address
+#   fullwidth-unicode-digits  by accident        an IME left in fullwidth mode
+#   percent-encoded-forms     sometimes          plausible for a pasted URL or
+#                                                log line; not for a hand-typed
+#                                                bare address
+#   decimal-hex-octal-ipv4    mostly by intent   narrow for this toolchain
+#
+# The first two were promoted from adversarial to ordinary-use in review. Neither
+# is handled: joining wrapped lines risks fusing unrelated tokens, and Unicode
+# normalisation widens every rule's blast radius. Both are design decisions, not
+# patches.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-text-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  public-text:
+    name: public text
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Full history and tags: the range walk needs the merge base, and tag
+          # bodies are not fetched by a shallow clone at all.
+          fetch-depth: 0
+
+      # The control must be proven ARMED before its verdict means anything.
+      #
+      # An earlier implementation of this idea had 22 green tests and could not
+      # detect its own removal: changing the final exit to 0 left every test
+      # passing, because the tests asserted the rule function's output rather
+      # than the gate's effect. These two steps assert the effect.
+      - name: Self-test — every seeded leak is caught, every clean message passes
+        run: python3 .github/lint/public_text_lint.py --selftest
+
+      - name: Self-test — a seeded leak actually FAILS the checker
+        run: |
+          set -euo pipefail
+          lint="$GITHUB_WORKSPACE/.github/lint/public_text_lint.py"
+          seeded="$(mktemp -d)/seeded"
+          git init -q "$seeded"
+          cd "$seeded"
+          git config user.email t@example.com
+          git config user.name T
+          # The BASE commit must be clean and the leak must land ABOVE it.
+          # `base..head` EXCLUDES base, so seeding the leak into the root commit
+          # puts it outside the range the checker walks -- the first version of
+          # this step did exactly that and reported the gate armed while the
+          # checker had never seen the leak at all.
+          git commit -q --allow-empty -m "base: clean"
+          base="$(git rev-parse HEAD)"
+          git commit -q --allow-empty -m "seeded: host 192.168.1.1 must be refused"
+
+          set +e
+          python3 "$lint" --base "$base" --head HEAD
+          leak_rc=$?
+          set -e
+          if [ "$leak_rc" -eq 0 ]; then
+            echo "ARMED CHECK FAILED: a seeded leak did not fail the checker."
+            echo "The gate is not gating. Do not trust a green run from this job."
+            exit 1
+          fi
+
+          # And the other direction: a clean commit above the leak must PASS, or
+          # the job would be one that fails everything, which is indistinguishable
+          # from a working gate when you only ever test the failing case.
+          git commit -q --allow-empty -m "clean: no environment detail here"
+          set +e
+          python3 "$lint" --base HEAD~1 --head HEAD
+          clean_rc=$?
+          set -e
+          if [ "$clean_rc" -ne 0 ]; then
+            echo "ARMED CHECK FAILED: a clean message was refused (rc $clean_rc)."
+            exit 1
+          fi
+          # THE TAG PATH NEEDS ITS OWN ARMED CHECK, and this step did not have
+          # one. A non-author mutation set found that blinding `tag_messages()`
+          # -- making it return nothing -- left the self-test passing AND this
+          # step passing, so the tag half of the gate could stop working with no
+          # run saying so. Five other mutations were caught; that one was not.
+          #
+          # It is the load-bearing half: tags are a live publishing channel here,
+          # and a tag placed on an already-published commit is exactly the case
+          # the commit walk structurally cannot see.
+          git tag -a seeded-leak -m "seeded tag: host 192.168.1.1 must be refused"
+          set +e
+          python3 "$lint" --tags
+          tag_leak_rc=$?
+          set -e
+          if [ "$tag_leak_rc" -eq 0 ]; then
+            echo "ARMED CHECK FAILED: a seeded leak in a TAG message did not fail"
+            echo "the checker. The tag half of the gate is not gating."
+            exit 1
+          fi
+
+          git tag -d seeded-leak >/dev/null
+          git tag -a clean-tag -m "clean tag: no environment detail here"
+          set +e
+          python3 "$lint" --tags
+          tag_clean_rc=$?
+          set -e
+          if [ "$tag_clean_rc" -ne 0 ]; then
+            echo "ARMED CHECK FAILED: a clean TAG message was refused (rc $tag_clean_rc)."
+            exit 1
+          fi
+
+          echo "armed: commit leak $leak_rc / clean $clean_rc;" \
+               "tag leak $tag_leak_rc / clean $tag_clean_rc"
+
+      - name: Lint commit messages introduced by this change
+        env:
+          REF: ${{ github.ref }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE:-}" ]; then
+            # A pull_request always carries both endpoints in its metadata.
+            base="$BASE"
+          else
+            # A push: lint what this push added. `before` is all-zero for a new
+            # ref, and absent entirely for workflow_dispatch.
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git merge-base origin/main HEAD || true)"
+            else
+              base="$before"
+            fi
+          fi
+
+          # A tag push adds no branch commits when the tagged commit is already
+          # in main: those messages were linted when main was pushed, and the
+          # tag's OWN message is linted by the separate tag step below. Only
+          # that case is exempt. A tag on a commit outside main still has
+          # merge-base..HEAD scanned here, because nothing else would scan it.
+          case "$REF" in
+            refs/tags/*)
+              if [ "$base" = "$HEAD" ] && git merge-base --is-ancestor "$HEAD" origin/main; then
+                echo "public_text_lint: $REF points at a commit already in main; no new commits."
+                exit 0
+              fi
+              ;;
+          esac
+
+          # FAIL LOUD ON AN UNDETERMINABLE RANGE rather than compute a vacuous one.
+          #
+          # A review found this: on workflow_dispatch there is no `before`, and
+          # actions/checkout leaves origin/main pointing at HEAD itself, so the
+          # fallback returned HEAD and the range was EMPTY. The job then printed
+          # "scanned 0 message(s) / clean" and exited 0 while HEAD's own message
+          # carried a private address. A gate that cannot tell what is new must
+          # say so, not pass.
+          if [ -z "${base:-}" ] || [ "$base" = "$HEAD" ]; then
+            echo "public_text_lint: cannot determine which commits are new."
+            echo "  base=${base:-<empty>} head=$HEAD event=${{ github.event_name }}"
+            echo "An empty range would scan nothing and report clean, which is"
+            echo "indistinguishable from a pass. Refusing instead."
+            echo "Re-run against a branch, or pass an explicit range locally:"
+            echo "  python3 .github/lint/public_text_lint.py --base <sha> --head <sha>"
+            exit 1
+          fi
+
+          echo "range: $base..${HEAD}"
+          python3 .github/lint/public_text_lint.py --base "$base" --head "$HEAD"
+
+      - name: Lint annotated tag messages
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        # Checkout v4.2.2 can force the pushed annotated tag's local ref to its
+        # commit object. Re-fetch the exact full ref before reading its message.
+        env:
+          TAG_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          case "$TAG_REF" in refs/tags/*) ;; *) echo "invalid tag ref"; exit 2;; esac
+          git fetch --no-tags origin "+${TAG_REF}:${TAG_REF}"
+          kind="$(git cat-file -t "$TAG_REF")"
+          if [ "$kind" = commit ]; then
+            echo "public_text_lint: $TAG_REF is lightweight; it has no tag message"
+          elif [ "$kind" = tag ]; then
+            python3 .github/lint/public_text_lint.py --tag-ref "$TAG_REF"
+          else
+            echo "public_text_lint: unexpected tag object type: $kind"
+            exit 2
+          fi
