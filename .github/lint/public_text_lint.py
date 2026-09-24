@@ -28,10 +28,13 @@ Exit status: 0 clean, 1 findings, 2 usage or internal error.
 from __future__ import annotations
 
 import argparse
+import copy
+import ipaddress
 import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,8 +65,32 @@ def _git(*args: str) -> str:
 def load_rules(path: Path = RULES_PATH) -> dict:
     with path.open(encoding="utf-8") as handle:
         rules = json.load(handle)
+
+    def required(obj: dict, key: str, kind: type, location: str):
+        if not isinstance(obj, dict) or key not in obj or not isinstance(obj[key], kind):
+            raise ValueError(f"invalid rules: {location}.{key} must be {kind.__name__}")
+        return obj[key]
+
+    if not isinstance(rules, dict):
+        raise ValueError("invalid rules: root must be object")
+    required(rules, "version", int, "root")
+    prefixes = required(required(rules, "documentation_addresses", dict, "root"), "prefixes", list, "documentation_addresses")
+    keys = required(required(rules, "trailer_exemption", dict, "root"), "keys", list, "trailer_exemption")
+    entries = required(rules, "rules", list, "root")
+    tokens = required(required(rules, "template_allowlist", dict, "root"), "tokens", list, "template_allowlist")
+    precedence = required(required(rules, "finding_precedence", dict, "root"), "suppressed_by", dict, "finding_precedence")
+    for location, items in (("documentation_addresses.prefixes", prefixes), ("trailer_exemption.keys", keys), ("template_allowlist.tokens", tokens)):
+        if not all(isinstance(item, str) and item for item in items):
+            raise ValueError(f"invalid rules: {location} must contain strings")
+    for dominant, subordinates in precedence.items():
+        if not isinstance(dominant, str) or not isinstance(subordinates, list) or not all(isinstance(item, str) for item in subordinates):
+            raise ValueError("invalid rules: finding_precedence.suppressed_by must map strings to string lists")
+    for index, rule in enumerate(entries):
+        for key in ("id", "pattern", "why", "severity"):
+            required(rule, key, str, f"rules[{index}]")
     for rule in rules["rules"]:
         rule["compiled"] = re.compile(rule["pattern"])
+    rules["documentation_networks"] = documentation_networks(prefixes)
     return rules
 
 
@@ -103,22 +130,50 @@ def strip_trailer_addresses(message: str, keys: list[str]) -> str:
     return "\n\n".join(paragraphs)
 
 
-def mask_documentation_addresses(message: str, prefixes: list[str]) -> str:
+def documentation_networks(prefixes: list[str]) -> list[ipaddress._BaseNetwork]:
+    """Configured three-octet IPv4 and two-hextet IPv6 prefixes denote /24 and /32."""
+    networks = []
+    for prefix in prefixes:
+        if re.fullmatch(r"(?:[0-9]{1,3}\.){3}", prefix):
+            networks.append(ipaddress.ip_network(prefix + "0/24", strict=False))
+        elif re.fullmatch(r"[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}:", prefix):
+            networks.append(ipaddress.ip_network(prefix + ":/32", strict=False))
+        else:
+            raise ValueError("invalid rules: documentation_addresses.prefixes contains an invalid prefix")
+    return networks
+
+
+ADDRESS_CANDIDATE = re.compile(r"(?<![A-Za-z0-9_:.])[0-9A-Fa-f:.]+(?![A-Za-z0-9_])")
+
+
+def mask_documentation_addresses(message: str, networks: list[ipaddress._BaseNetwork]) -> str:
     """Replace reserved documentation addresses with a neutral placeholder.
 
     Done ONCE here rather than inside each rule. When an earlier implementation
     carved these out of one rule and not another, the same address drew opposite
     verdicts from two rules in the repository the carve-out existed to protect.
     """
-    for prefix in prefixes:
-        message = message.replace(prefix, "reserved-example.")
-    return message
+    # A candidate starts outside an address/word continuation. A trailing full
+    # stop is prose punctuation; internal dots and colons remain in the token.
+    # Parse the COMPLETE candidate, then replace it with same-width nonspace
+    # text. Spaces could split a token and CREATE an allowlisted spelling.
+    def mask(match: re.Match[str]) -> str:
+        token = match.group().rstrip(".")
+        try:
+            address = ipaddress.ip_address(token)
+        except ValueError:
+            return match.group()
+        if any(address in network for network in networks):
+            return "x" * len(token) + match.group()[len(token):]
+        return match.group()
+
+    return ADDRESS_CANDIDATE.sub(mask, message)
 
 
 def scan(message: str, source: str, rules: dict) -> list[Finding]:
     cleaned = strip_trailer_addresses(message, rules["trailer_exemption"]["keys"])
     cleaned = mask_documentation_addresses(
-        cleaned, rules["documentation_addresses"]["prefixes"]
+        cleaned, rules["documentation_networks"]
     )
 
     findings: list[Finding] = []
@@ -126,6 +181,13 @@ def scan(message: str, source: str, rules: dict) -> list[Finding]:
         # finditer, not search: report every occurrence. One message with four
         # private addresses should cost one fix, not four red runs.
         for match in rule["compiled"].finditer(cleaned):
+            if rule["id"] == "private-ipv6":
+                try:
+                    address = ipaddress.IPv6Address(match.group())
+                except ValueError:
+                    continue
+                if address not in ipaddress.ip_network("fc00::/7") and address not in ipaddress.ip_network("fe80::/10"):
+                    continue
             if (
                 rule["id"] == "tilde-checkout-path"
                 and _whole_token(cleaned, match.start())
@@ -206,7 +268,7 @@ def commit_messages(base: str, head: str) -> list[tuple[str, str]]:
     return [(sha, _git("log", "-1", "--format=%B", sha)) for sha in shas]
 
 
-def tag_messages() -> list[tuple[str, str]]:
+def tag_messages(ref: str | None = None) -> list[tuple[str, str]]:
     """Annotated tag bodies, which `git log` never reads.
 
     `git log <tag>` peels to the tagged commit, so a tag placed on an
@@ -216,21 +278,31 @@ def tag_messages() -> list[tuple[str, str]]:
     names = [
         line.strip()
         for line in _git(
-            "for-each-ref", "--format=%(refname:short)", "refs/tags/*"
+            "for-each-ref", "--format=%(refname)", ref or "refs/tags/"
         ).splitlines()
         if line.strip()
     ]
+    if ref and (not ref.startswith("refs/tags/") or names != [ref]):
+        raise RuntimeError("pushed tag full ref is missing or invalid")
     # ONE TAG AT A TIME, for the same reason commits are read one at a time.
     # The first version of this function batched them with a separator byte and
     # split on it -- reintroducing, in the tag path, the exact defect the commit
     # path was written to avoid. A repair inherits the defect one axis over.
     messages: list[tuple[str, str]] = []
+    lightweight = 0
     for name in names:
-        body = _git("for-each-ref", "--format=%(contents)", f"refs/tags/{name}")
+        kind = _git("cat-file", "-t", name).strip()
+        if kind == "commit":
+            print(f"public_text_lint: {name} is lightweight; it has no tag message")
+            lightweight += 1
+            continue
+        if kind != "tag":
+            raise RuntimeError(f"{name} is neither an annotated nor a lightweight tag")
+        body = _git("for-each-ref", "--format=%(contents)", name)
         messages.append((f"tag {name}", body))
-    if len(messages) != len(names):
+    if len(messages) + lightweight != len(names):
         raise RuntimeError(
-            f"enumerated {len(names)} tags but read {len(messages)} messages"
+            f"enumerated {len(names)} tags but could not account for every tag"
         )
     return messages
 
@@ -240,13 +312,28 @@ SELFTEST_CASES = [
     ("see https://claude.ai/code/abcdef123456", "session-url"),
     ("ref session_0123456789abcdefghijklmn", "session-id"),
     ("host at 192.168.1.10 was unreachable", "private-ipv4"),
+    ("host 10.0.0.5.", "private-ipv4"),
+    ("host 10.0.0.5,", "private-ipv4"),
+    ("host 10.0.0.5;", "private-ipv4"),
+    ("host (10.0.0.5)", "private-ipv4"),
+    ("host 10.0.0.5", "private-ipv4"),
     ("moved /home/someone/project/file.rs", "absolute-home-path"),
     ("built in ~/coding/thing", "tilde-checkout-path"),
     ("removed worktrees/scratch-1", "worktree-path"),
     ("ssh user@10.0.0.5 to check", "user-at-ip-literal"),
     ("nic 0a:1b:2c:3d:4e:5f flapped", "mac-address"),
+    ("nic 0a:1b:2c:3d:4e:5f.", "mac-address"),
+    ("nic 0a:1b:2c:3d:4e:5f,", "mac-address"),
+    ("nic 0a:1b:2c:3d:4e:5f;", "mac-address"),
+    ("nic (0a:1b:2c:3d:4e:5f)", "mac-address"),
+    ("nic 0a:1b:2c:3d:4e:5f", "mac-address"),
     ("addr fe80::1c2d:3e4f:5a6b:7c8d on the link", "private-ipv6"),
     ("addr fd12:3456:789a::1 assigned", "private-ipv6"),
+    ("host fd12::", "private-ipv6"),
+    ("host fe80::", "private-ipv6"),
+    ("host fd12:2001:db8::1", "private-ipv6"),
+    ("docs 2001:db8::1 and host fd12::", "private-ipv6"),
+    ("probe ~/elastic/elastic-agent-*/),2001:db8::1", "tilde-checkout-path"),
     ("wrote /root/config.toml", "absolute-home-path"),
     ("built in $HOME/coding/thing", "tilde-checkout-path"),
     ("removed worktree/scratch", "worktree-path"),
@@ -275,12 +362,13 @@ SELFTEST_CASES = [
     ("moved /home/realuser/project* to storage", "absolute-home-path"),
     ("cleaned up /home/someone/.cache/thing-* before rebuilding", "absolute-home-path"),
     # The suppression found in review, paired with its no-glob control.
-    ("cleaned ~/mathew/backups/old-project-*", "tilde-checkout-path"),
-    ("cleaned ~/mathew/backups/old-project", "tilde-checkout-path"),
+    ("cleaned ~/someone/backups/old-project-*", "tilde-checkout-path"),
+    ("cleaned ~/someone/backups/old-project", "tilde-checkout-path"),
     # Synthetic and not allowlisted; the heuristic that exempted it is gone.
     ("fix: probe ~/vendor/product-*/bin for the tool", "tilde-checkout-path"),
     # Different tokens: no suffix, wildcard, punctuation or quote normalisation.
-    ("probe ~/elastic/elastic-agent-*/mathew", "tilde-checkout-path"),
+    ("probe ~/elastic/elastic-agent-*/someone", "tilde-checkout-path"),
+    ("probe ~/elastic/elastic-agent-*/", "tilde-checkout-path"),
     ("probe ~/elastic/elastic-agent-*/),host", "tilde-checkout-path"),
     ("probe ~/elastic/elastic-agent-**/", "tilde-checkout-path"),
     ("probe ~/elastic/elastic-agent-*/).", "tilde-checkout-path"),
@@ -295,14 +383,20 @@ SELFTEST_CLEAN = [
     "Co-Authored-By: Someone <someone@example.com>\n",
     "docs: cite the reserved example address 192.0.2.254 in a doc comment\n",
     "test: cover the 2001:db8::1 documentation prefix\n",
-    # Generic agent-discovery template's clean spelling: exact listed token.
-    "fix: search ~/elastic/elastic-agent-*/ for the binary\n",
     # Historical token at 1d5ac56, including punctuation; the clean entry does
     # not cover this distinct spelling under exact whole-token equality.
     "(env -> PATH -> /opt/Elastic/Agent -> ~/elastic/elastic-agent-*/), registry",
     # A message ending in a blank line leaves paragraphs[-1] empty; the real
     # trailer is one element back and must still be exempted.
     "fix: something\n\nCo-Authored-By: Someone <someone@example.com>\n\n",
+    "docs: use user@[2001:DB8::1] as the reserved example",
+    "docs: 192.0.2.254, 2001:0DB8::1; 233.252.0.1",
+    "host 10.0.0.5.6 is an invalid longer token",
+    "nic 0a:1b:2c:3d:4e:5f:60 is seven octets",
+    "nic 0a-1b-2c-3d-4e-5f-60 is seven octets",
+    "host fd12::: is an invalid longer token",
+    "host fd12::gg is an invalid longer token",
+    "docs 2001:db8::1suffix is not a complete address",
 ]
 
 
@@ -316,6 +410,17 @@ def selftest(rules: dict) -> int:
     separate step whose failure fails the job.
     """
     failures = 0
+    if rules["template_allowlist"]["tokens"] != ["~/elastic/elastic-agent-*/),"]:
+        print("SELFTEST FAIL: allowlist must contain only the cited historical token")
+        failures += 1
+    fixture_texts = {text for text, _ in SELFTEST_CASES}
+    placeholder = "someone"
+    for text in (f"cleaned ~/{placeholder}/backups/old-project-*",
+                 f"cleaned ~/{placeholder}/backups/old-project",
+                 f"probe ~/elastic/elastic-agent-*/{placeholder}"):
+        if text not in fixture_texts:
+            print("SELFTEST FAIL: path fixture lost its generic placeholder")
+            failures += 1
     for text, expected_rule in SELFTEST_CASES:
         found = {f.rule_id for f in scan(text, "selftest", rules)}
         if expected_rule not in found:
@@ -332,10 +437,38 @@ def selftest(rules: dict) -> int:
                 f"{sorted(set(found))}"
             )
             failures += 1
-    # For both permitted tokens, adding one to a message must preserve ALL
+    # Mandatory structure is rejected at load time, independent of the text.
+    raw = json.loads(RULES_PATH.read_text(encoding="utf-8"))
+    paths = (("version",), ("documentation_addresses",), ("documentation_addresses", "prefixes"),
+             ("trailer_exemption",), ("trailer_exemption", "keys"),
+             ("template_allowlist",), ("template_allowlist", "tokens"),
+             ("finding_precedence",), ("finding_precedence", "suppressed_by"),
+             ("rules",), ("rules", 0, "id"), ("rules", 0, "pattern"),
+             ("rules", 0, "why"), ("rules", 0, "severity"))
+    for path in paths:
+        for mutation in ("missing", "wrong type"):
+            broken = copy.deepcopy(raw)
+            parent = broken
+            for part in path[:-1]:
+                parent = parent[part]
+            if mutation == "missing":
+                del parent[path[-1]]
+            else:
+                parent[path[-1]] = [] if path == ("version",) else 7
+            with tempfile.TemporaryDirectory() as directory:
+                file = Path(directory) / "rules.json"
+                file.write_text(json.dumps(broken), encoding="utf-8")
+                try:
+                    load_rules(file)
+                except (ValueError, KeyError, TypeError, re.error):
+                    pass
+                else:
+                    print(f"SELFTEST FAIL: invalid mandatory path {path} ({mutation}) loaded")
+                    failures += 1
+    # Adding the permitted token to a message must preserve ALL
     # findings from the separate tokens, including every other rule. Comparing
     # lists also catches a spurious finding on the allowed token itself.
-    for template in ("~/elastic/elastic-agent-*/", "~/elastic/elastic-agent-*/),"):
+    for template in ("~/elastic/elastic-agent-*/),",):
         for text, _ in SELFTEST_CASES:
             expected = scan(text, "selftest", rules)
             found = scan(f"{text}\t{template}", "selftest", rules)
@@ -360,7 +493,7 @@ def selftest(rules: dict) -> int:
     print(
         f"public_text_lint selftest: {len(SELFTEST_CASES)} seeded leaks caught, "
         f"{len(SELFTEST_CLEAN)} clean messages passed; "
-        f"{2 * len(SELFTEST_CASES)} mixed-message and 2 other-rule controls passed"
+        f"{len(SELFTEST_CASES)} mixed-message and 1 other-rule control passed"
     )
     return 0
 
@@ -372,6 +505,7 @@ def main() -> int:
     parser.add_argument(
         "--tags", action="store_true", help="also scan annotated tag messages"
     )
+    parser.add_argument("--tag-ref", help="scan one pushed tag by full refs/tags/ name")
     parser.add_argument(
         "--selftest",
         action="store_true",
@@ -388,7 +522,7 @@ def main() -> int:
     if args.selftest:
         return selftest(rules)
 
-    if not args.base and not args.tags:
+    if not args.base and not args.tags and not args.tag_ref:
         print(
             "public_text_lint: --base is required unless --selftest or --tags "
             "is given"
@@ -397,8 +531,8 @@ def main() -> int:
 
     try:
         subjects = commit_messages(args.base, args.head) if args.base else []
-        if args.tags:
-            subjects += tag_messages()
+        if args.tags or args.tag_ref:
+            subjects += tag_messages(args.tag_ref)
     except RuntimeError as error:
         print(f"public_text_lint: {error}")
         return 2
