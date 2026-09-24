@@ -2050,9 +2050,14 @@ mod tests {
             if !trimmed.starts_with("mod ") {
                 continue;
             }
-            let Some(open_rel) = after.find('{') else {
+            // An out-of-line `mod name;` has no body. Never search beyond its
+            // semicolon for a brace belonging to a later production item.
+            let Some(open_rel) = after.find(['{', ';']) else {
                 continue;
             };
+            if after.as_bytes()[open_rel] == b';' {
+                continue;
+            }
             let open = marker + "#[cfg(test)]".len() + open_rel;
             let Some(end) = matching_brace(src, open) else {
                 continue;
@@ -2068,7 +2073,7 @@ mod tests {
         out
     }
 
-    /// If a raw string starts at `i` (`r"`, `r#"`, `r##"` ...), the index just
+    /// If a raw string starts at `i` (`r"`, `br#"`, `cr##"` ...), the index just
     /// past its closing delimiter.
     ///
     /// Raw strings matter here because a backslash inside one is NOT an escape.
@@ -2079,25 +2084,22 @@ mod tests {
     /// anyone maintains on purpose.
     fn raw_string_end(src: &str, i: usize) -> Option<usize> {
         let bytes = src.as_bytes();
-        if bytes.get(i) != Some(&b'r') {
+        let r = match (bytes.get(i), bytes.get(i + 1)) {
+            (Some(b'r'), _) => i,
+            (Some(b'b' | b'c'), Some(b'r')) => i + 1,
+            _ => return None,
+        };
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
             return None;
         }
         let mut hashes = 0usize;
-        let mut j = i + 1;
+        let mut j = r + 1;
         while bytes.get(j) == Some(&b'#') {
             hashes += 1;
             j += 1;
         }
         if bytes.get(j) != Some(&b'"') {
             return None;
-        }
-        // `r` must not be the tail of an identifier (`foo_r"..."` is not a raw
-        // string, and `br"..."` is handled by the caller stepping onto the `r`).
-        if i > 0 {
-            let prev = bytes[i - 1];
-            if prev.is_ascii_alphanumeric() && prev != b'b' || prev == b'_' {
-                return None;
-            }
         }
         let mut k = j + 1;
         while k < bytes.len() {
@@ -2115,13 +2117,40 @@ mod tests {
         None
     }
 
+    /// A character literal has one character or one escape, followed by a quote.
+    /// A lifetime (`'a`, `'static`) has no closing quote at that position.
+    fn char_literal_end(src: &str, i: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let quote = if bytes.get(i) == Some(&b'b') && bytes.get(i + 1) == Some(&b'\'') {
+            i + 1
+        } else if bytes.get(i) == Some(&b'\'') {
+            i
+        } else {
+            return None;
+        };
+        let first = quote + 1;
+        let end = if bytes.get(first) == Some(&b'\\') {
+            if bytes.get(first + 1) == Some(&b'u') && bytes.get(first + 2) == Some(&b'{') {
+                let close = bytes.get(first + 3..)?.iter().position(|&b| b == b'}')? + first + 3;
+                close + 1
+            } else if bytes.get(first + 1) == Some(&b'x') {
+                first + 4
+            } else {
+                first + 2
+            }
+        } else {
+            first + src.get(first..)?.chars().next()?.len_utf8()
+        };
+        (bytes.get(end) == Some(&b'\'')).then_some(end + 1)
+    }
+
     /// Index of the `}` closing the `{` at `open`, honouring strings, char
     /// literals and comments so a brace inside any of them cannot end the block.
     fn matching_brace(src: &str, open: usize) -> Option<usize> {
         let bytes = src.as_bytes();
         let mut depth = 0usize;
         let mut i = open;
-        let (mut in_str, mut in_char, mut escaped) = (false, false, false);
+        let (mut in_str, mut escaped) = (false, false);
         let mut in_line = false;
         let mut block_depth = 0usize;
         while i < bytes.len() {
@@ -2152,15 +2181,13 @@ mod tests {
                 i += 1;
                 continue;
             }
-            if in_str || in_char {
+            if in_str {
                 if escaped {
                     escaped = false;
                 } else if c == '\\' {
                     escaped = true;
-                } else if in_str && c == '"' {
+                } else if c == '"' {
                     in_str = false;
-                } else if in_char && c == '\'' {
-                    in_char = false;
                 }
                 i += 1;
                 continue;
@@ -2176,12 +2203,15 @@ mod tests {
                     i += 2;
                     continue;
                 }
-                'r' | 'b' if raw_string_end(src, i).is_some() => {
+                'r' | 'b' | 'c' if raw_string_end(src, i).is_some() => {
                     i = raw_string_end(src, i).expect("checked");
                     continue;
                 }
+                '\'' | 'b' if char_literal_end(src, i).is_some() => {
+                    i = char_literal_end(src, i).expect("checked");
+                    continue;
+                }
                 '"' => in_str = true,
-                '\'' if bytes.get(i + 2) == Some(&b'\'') => in_char = true,
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
@@ -2240,10 +2270,14 @@ mod tests {
     ///     discovered, because "the tree-wide guard passes" will otherwise be read
     ///     as "the repository is clean", and the repository is larger than the
     ///     crate.
+    const ALTERNATE_SPECS: [&str; 2] = [":#}", ":#?}"];
+
+    fn has_alternate_render(line: &str) -> bool {
+        ALTERNATE_SPECS.iter().any(|spec| line.contains(spec))
+    }
+
     #[test]
     fn no_production_source_renders_an_error_with_the_alternate_form() {
-        const ALTERNATE_SPECS: [&str; 2] = [":#}", ":#?}"];
-
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let files = rust_sources(&root);
 
@@ -2270,11 +2304,9 @@ mod tests {
             let region = strip_comments(&production_region(&raw));
             scanned_bytes += region.len();
             for (index, line) in region.lines().enumerate() {
-                for spec in ALTERNATE_SPECS {
-                    if line.contains(spec) {
-                        let shown = path.strip_prefix(&root).unwrap_or(path);
-                        findings.push(format!("{}:{} {}", shown.display(), index + 1, line.trim()));
-                    }
+                if has_alternate_render(line) {
+                    let shown = path.strip_prefix(&root).unwrap_or(path);
+                    findings.push(format!("{}:{} {}", shown.display(), index + 1, line.trim()));
                 }
             }
         }
@@ -2352,17 +2384,13 @@ mod tests {
     /// four comments -- so a scan that cannot tell code from commentary would fire
     /// on the documentation of the rule it enforces.
     ///
-    /// Tracks string and char literals so a `//` inside a string is not mistaken
-    /// for the start of a comment. Raw strings (`r"..."`, `r#"..."#`) are NOT
-    /// handled: a `\` inside one is treated as an escape, which can only make the
-    /// stripper consume MORE than it should and so can only produce a false
-    /// negative in a file containing one. None of the files walked here contains a
-    /// raw string with a quote in it; the test below pins the cases that matter.
+    /// Tracks ordinary, raw, byte and C strings and char literals so comment
+    /// markers inside them cannot erase later production source.
     fn strip_comments(src: &str) -> String {
         let bytes = src.as_bytes();
         let mut out = String::with_capacity(src.len());
         let mut i = 0usize;
-        let (mut in_str, mut in_char, mut escaped) = (false, false, false);
+        let (mut in_str, mut escaped) = (false, false);
         let mut block_depth = 0usize;
         let mut in_line = false;
         while i < bytes.len() {
@@ -2395,16 +2423,14 @@ mod tests {
                 i += 1;
                 continue;
             }
-            if in_str || in_char {
+            if in_str {
                 out.push(c);
                 if escaped {
                     escaped = false;
                 } else if c == '\\' {
                     escaped = true;
-                } else if in_str && c == '"' {
+                } else if c == '"' {
                     in_str = false;
-                } else if in_char && c == '\'' {
-                    in_char = false;
                 }
                 i += 1;
                 continue;
@@ -2421,11 +2447,22 @@ mod tests {
                 i += 2;
                 continue;
             }
+            if matches!(c, 'r' | 'b' | 'c') {
+                if let Some(end) = raw_string_end(src, i) {
+                    out.push_str(&src[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
+            if matches!(c, '\'' | 'b') {
+                if let Some(end) = char_literal_end(src, i) {
+                    out.push_str(&src[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
             if c == '"' {
                 in_str = true;
-            } else if c == '\'' && bytes.get(i + 2) == Some(&b'\'') {
-                // Only the three-byte char form, so a lifetime is left alone.
-                in_char = true;
             }
             out.push(c);
             i += 1;
@@ -2527,7 +2564,8 @@ mod tests {
         let chars = concat!(
             "#[cfg(test)]\n",
             "mod tests {\n",
-            "    fn a() { let _ = '}'; let _ = \"DROP_ME\"; }\n",
+            "    const C: char = '}';\n",
+            "    fn a() { let _ = \"DROP_ME\"; }\n",
             "}\n",
             "fn production_five() { let _ = \"KEEP_FIVE\"; }\n",
         );
@@ -2545,6 +2583,8 @@ mod tests {
             "mod tests {\n",
             "    const A: &str = r\"trailing backslash \\\";\n",
             "    const B: &str = r#\"has \"quotes\" and a } brace\"#;\n",
+            "    const C: &[u8] = br#\"quoted \" } byte raw\"#;\n",
+            "    const D: &std::ffi::CStr = cr#\"quoted \" } C raw\"#;\n",
             "    fn a() { let _ = \"DROP_ME\"; }\n",
             "}\n",
             "fn production_six() { let _ = \"KEEP_SIX\"; }\n",
@@ -2616,9 +2656,7 @@ mod tests {
         assert!(source.lines().any(|line| line.trim() == render));
         let preprocessed = strip_comments(&production_region(source));
         let retained = preprocessed.lines().any(|line| line.trim() == render);
-        let flagged = preprocessed
-            .lines()
-            .any(|line| [":#}", ":#?}"].iter().any(|spec| line.contains(spec)));
+        let flagged = preprocessed.lines().any(has_alternate_render);
         assert_eq!(
             (retained, flagged),
             (true, true),
