@@ -5,6 +5,7 @@
 use crate::es_model::EbpfDocument;
 use anyhow::{Context, Result};
 use reqwest::{Certificate, Client};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -90,8 +91,7 @@ impl EsShipper {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            let preview: String = text.chars().take(500).collect();
-            error!("ES bulk API returned {}: {}", status, preview);
+            error!("{}", bulk_failure_message(status, &text));
             // Docs are dropped on error — eBPF telemetry is best-effort.
             return Ok(());
         }
@@ -144,6 +144,41 @@ impl EsShipper {
 
         Ok(())
     }
+}
+
+fn bulk_failure_message(status: reqwest::StatusCode, body: &str) -> String {
+    format!(
+        "ES bulk API returned {}: {}",
+        status,
+        escape_for_log(truncate_chars(body, 500))
+    )
+}
+
+fn truncate_chars(s: &str, max_bytes: usize) -> &str {
+    &s[..s.floor_char_boundary(max_bytes.min(s.len()))]
+}
+
+fn escape_for_log(s: &str) -> Cow<'_, str> {
+    let needs_escape = |c: char| {
+        matches!(c, '\\' | '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}'
+            | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
+            | '\u{2028}' | '\u{2029}' | '\u{2066}'..='\u{2069}')
+    };
+    if !s.chars().any(needs_escape) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if needs_escape(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 fn ca_certificate_bundle(bytes: &[u8]) -> Result<Vec<Certificate>> {
@@ -229,7 +264,10 @@ fn build_bulk_body(docs: &[EbpfDocument]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ca_certificate_bundle, filter_supported_docs};
+    use super::{
+        bulk_failure_message, ca_certificate_bundle, escape_for_log, filter_supported_docs,
+        truncate_chars,
+    };
     use crate::{
         aggregator::{RawSchedEvent, SchedAggregator, EVENT_SWITCH},
         es_model::{EbpfDocument, NAMED_PROBES},
@@ -254,11 +292,36 @@ mod tests {
         doc
     }
 
+    #[test]
+    fn bulk_failure_message_does_not_forge_a_line() {
+        let message = bulk_failure_message(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "ok\nFORGED line",
+        );
+        assert!(!message.contains('\n'), "{message:?}");
+        assert!(message.contains("\\n"));
+    }
+
+    #[test]
+    fn log_helpers_escape_controls_and_truncate_on_char_boundaries() {
+        assert_eq!(
+            escape_for_log("\\n\u{85}\u{2028}\u{202e}\u{2066}"),
+            "\\\\n\\u{85}\\u{2028}\\u{202e}\\u{2066}"
+        );
+        let text = format!("{}é", "a".repeat(499));
+        assert_eq!(truncate_chars(&text, 500).len(), 499);
+    }
+
     const TEST_CA: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBcTCCARegAwIBAgIUFcCd4QbbalB9vcqsIBvd3Tbhx7kwCgYIKoZIzj0EAwIw\nDjEMMAoGA1UEAwwDb25lMB4XDTI2MDczMTA4MDU0MloXDTI2MDgwMTA4MDU0Mlow\nDjEMMAoGA1UEAwwDb25lMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEBB9OC7xC\n6hGn6GNVbHVnsGwfmI0MJHSAiZDAjyHYn71C2EufTKa9yMy9EK53OEhSiOXTm8ob\nK3Z1F8FoTaUWa6NTMFEwHQYDVR0OBBYEFAiHcI/D49ZptsjDCKqSp8S+M5V+MB8G\nA1UdIwQYMBaAFAiHcI/D49ZptsjDCKqSp8S+M5V+MA8GA1UdEwEB/wQFMAMBAf8w\nCgYIKoZIzj0EAwIDSAAwRQIgSu9o44gWsyAvtbeXKuhIi4vUxSn6TU8N/SCPNVag\n5a0CIQD0jGGCQNjrdXYdp+Ai9qnxDgPWuP5S2f6YglCV2U2+LQ==\n-----END CERTIFICATE-----\n";
 
     #[test]
     fn ca_bundle_accepts_two_certificates_and_rejects_empty_or_garbage() {
-        assert_eq!(ca_certificate_bundle(&[TEST_CA, TEST_CA].concat()).unwrap().len(), 2);
+        assert_eq!(
+            ca_certificate_bundle(&[TEST_CA, TEST_CA].concat())
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(ca_certificate_bundle(b"").is_err());
         assert!(ca_certificate_bundle(b"not a certificate").is_err());
     }

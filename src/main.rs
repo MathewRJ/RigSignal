@@ -19,6 +19,7 @@ mod dllscan;
 mod handshake;
 mod host;
 mod launchers_windows;
+mod log_safe;
 mod profiles;
 #[cfg(target_os = "linux")]
 mod remote_connections;
@@ -1635,7 +1636,7 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
 
 /// Render an error for an operator log: the error's own message, plus the OS
 /// error code and its strerror text when one is anywhere in the cause chain,
-/// and nothing else.
+/// and nothing else. Controls in the outer message are escaped.
 ///
 /// Why this exists, and why it is not simply `{:#}`. On a full disk the spool
 /// warnings printed only `flushing spool writer` — the errno never reached the
@@ -1654,10 +1655,14 @@ fn handshake_root_telemetry_guard(cli: &Cli) -> Result<(), clap::Error> {
 /// relied on. It is NOT a claim that a syscall produced the value:
 /// `from_raw_os_error` lets a caller choose the number. Choosing a misleading
 /// errno is a far smaller problem than echoing an arbitrary string, which is the
-/// trade this makes. When no OS error is in the chain the output is
-/// byte-identical to the previous `{}` behaviour, so nothing that used to be
-/// logged stops being logged.
+/// trade this makes. When no OS error is in the chain, text with no control,
+/// separator, bidi or backslash character stays byte-identical to the previous
+/// `{}` behaviour. A backslash is doubled, so a Windows path logs as
+/// `C:\\ProgramData\\...`: that is what keeps a real line break (`\n`, two
+/// characters) distinguishable from the literal text `\n` (three).
 fn error_for_log(err: &anyhow::Error) -> String {
+    let outer_message = err.to_string();
+    let outer = log_safe::escape_for_log(&outer_message);
     for (depth, cause) in err.chain().enumerate() {
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
             if io_err.raw_os_error().is_some() {
@@ -1666,13 +1671,13 @@ fn error_for_log(err: &anyhow::Error) -> String {
                 // a failed removal of an empty replacement file propagates a bare
                 // io::Error with no context.
                 if depth == 0 {
-                    return format!("{err}");
+                    return outer.into_owned();
                 }
-                return format!("{err}: {io_err}");
+                return format!("{outer}: {io_err}");
             }
         }
     }
-    format!("{err}")
+    outer.into_owned()
 }
 
 #[cfg(test)]
@@ -1975,6 +1980,727 @@ mod tests {
             rendered.ends_with('Z') && rendered.contains('-'),
             "unexpected rendering: {rendered}"
         );
+    }
+
+    /// Every `.rs` file under the crate root that is production source.
+    ///
+    /// Read from the filesystem at test time rather than enumerated with
+    /// `include_str!`, because a hand-written list is exactly the thing that goes
+    /// stale: a module added next month would simply not be covered, and nothing
+    /// would say so. `CARGO_MANIFEST_DIR` is a compile-time constant pointing at
+    /// this crate's own directory, so the walk finds the sources this binary was
+    /// built from.
+    fn rust_sources(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if path.is_dir() {
+                    // `tests/` holds integration tests, `target/` build output.
+                    if name == "tests" || name == "target" || name.starts_with('.') {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if name.ends_with(".rs") {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The file with its `#[cfg(test)] mod ... { ... }` blocks removed, and
+    /// nothing else removed.
+    ///
+    /// THE OBVIOUS IMPLEMENTATION IS WRONG AND WAS REJECTED IN REVIEW. Cutting the
+    /// file at the first line-anchored `#[cfg(test)]` assumes that marker is the
+    /// start of the test module and that nothing production follows it. Both
+    /// halves are false in this crate, measured:
+    ///
+    ///   * `shipper.rs` opens with a `#[cfg(test)] use ...;` -- an idiomatic
+    ///     test-only import -- at line 14, so the cut landed there and scanned
+    ///     461 of 67,933 bytes. 99.3% of the ES bulk shipper was excluded from a
+    ///     guard whose whole subject is what that file logs.
+    ///   * `session.rs` places production code AFTER its test module by design,
+    ///     with an `#[allow(clippy::items_after_test_module)]` and a comment
+    ///     saying so. 60% of it was excluded, including eight warning sites.
+    ///
+    /// So remove the test MODULES by brace matching and keep everything else. A
+    /// `#[cfg(test)]` on a single item has no block and is left alone; it cannot
+    /// carry a hazard, and cutting at it costs the rest of the file.
+    ///
+    /// Removed spans are replaced by newlines rather than deleted, so reported
+    /// line numbers still refer to the real file.
+    fn production_region(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut cursor = 0usize;
+        for (marker, _) in src.match_indices("#[cfg(test)]") {
+            if marker < cursor {
+                continue;
+            }
+            if marker != 0 && bytes[marker - 1] != b'\n' {
+                continue; // indented: not a top-level item
+            }
+            // Only a MODULE is removed. Anything else keeps its place.
+            let after = &src[marker + "#[cfg(test)]".len()..];
+            let trimmed = after.trim_start();
+            if !trimmed.starts_with("mod ") {
+                continue;
+            }
+            // An out-of-line `mod name;` has no body. Never search beyond its
+            // semicolon for a brace belonging to a later production item.
+            let Some(open_rel) = after.find(['{', ';']) else {
+                continue;
+            };
+            if after.as_bytes()[open_rel] == b';' {
+                continue;
+            }
+            let open = marker + "#[cfg(test)]".len() + open_rel;
+            let Some(end) = matching_brace(src, open) else {
+                continue;
+            };
+            out.push_str(&src[cursor..marker]);
+            // Preserve line count so line numbers stay true to the file.
+            for _ in src[marker..=end].bytes().filter(|b| *b == b'\n') {
+                out.push('\n');
+            }
+            cursor = end + 1;
+        }
+        out.push_str(&src[cursor..]);
+        out
+    }
+
+    /// If a raw string starts at `i` (`r"`, `br#"`, `cr##"` ...), the index just
+    /// past its closing delimiter.
+    ///
+    /// Raw strings matter here because a backslash inside one is NOT an escape.
+    /// A review found live instances: `config.rs` holds `r#"..."#` TOML fixtures,
+    /// and treating them as ordinary strings desynchronises the quote tracker.
+    /// They are currently benign only by coincidence -- every embedded string
+    /// happens to contribute an even quote count -- which is not a property
+    /// anyone maintains on purpose.
+    fn raw_string_end(src: &str, i: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let r = match (bytes.get(i), bytes.get(i + 1)) {
+            (Some(b'r'), _) => i,
+            (Some(b'b' | b'c'), Some(b'r')) => i + 1,
+            _ => return None,
+        };
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            return None;
+        }
+        let mut hashes = 0usize;
+        let mut j = r + 1;
+        while bytes.get(j) == Some(&b'#') {
+            hashes += 1;
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'"') {
+            return None;
+        }
+        let mut k = j + 1;
+        while k < bytes.len() {
+            if bytes[k] == b'"' {
+                let mut closing = 0usize;
+                while closing < hashes && bytes.get(k + 1 + closing) == Some(&b'#') {
+                    closing += 1;
+                }
+                if closing == hashes {
+                    return Some(k + 1 + hashes);
+                }
+            }
+            k += 1;
+        }
+        None
+    }
+
+    /// A character literal has one character or one escape, followed by a quote.
+    /// A lifetime (`'a`, `'static`) has no closing quote at that position.
+    fn char_literal_end(src: &str, i: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let quote = if bytes.get(i) == Some(&b'b') && bytes.get(i + 1) == Some(&b'\'') {
+            i + 1
+        } else if bytes.get(i) == Some(&b'\'') {
+            i
+        } else {
+            return None;
+        };
+        let first = quote + 1;
+        let end = if bytes.get(first) == Some(&b'\\') {
+            if bytes.get(first + 1) == Some(&b'u') && bytes.get(first + 2) == Some(&b'{') {
+                let close = bytes.get(first + 3..)?.iter().position(|&b| b == b'}')? + first + 3;
+                close + 1
+            } else if bytes.get(first + 1) == Some(&b'x') {
+                first + 4
+            } else {
+                first + 2
+            }
+        } else {
+            first + src.get(first..)?.chars().next()?.len_utf8()
+        };
+        (bytes.get(end) == Some(&b'\'')).then_some(end + 1)
+    }
+
+    /// Index of the `}` closing the `{` at `open`, honouring strings, char
+    /// literals and comments so a brace inside any of them cannot end the block.
+    fn matching_brace(src: &str, open: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut i = open;
+        let (mut in_str, mut escaped) = (false, false);
+        let mut in_line = false;
+        let mut block_depth = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            let next = bytes.get(i + 1).map(|b| *b as char);
+            if in_line {
+                if c == '\n' {
+                    in_line = false;
+                }
+                i += 1;
+                continue;
+            }
+            if block_depth > 0 {
+                // DEPTH, not a flag. Rust block comments nest, and the sibling
+                // `strip_comments` already counted depth -- this function was
+                // written with a bool and regressed against a correct pattern
+                // sitting a few hundred lines away in the same file.
+                if c == '/' && next == Some('*') {
+                    block_depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if c == '*' && next == Some('/') {
+                    block_depth -= 1;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '/' if next == Some('/') => {
+                    in_line = true;
+                    i += 2;
+                    continue;
+                }
+                '/' if next == Some('*') => {
+                    block_depth = 1;
+                    i += 2;
+                    continue;
+                }
+                'r' | 'b' | 'c' if raw_string_end(src, i).is_some() => {
+                    i = raw_string_end(src, i).expect("checked");
+                    continue;
+                }
+                '\'' | 'b' if char_literal_end(src, i).is_some() => {
+                    i = char_literal_end(src, i).expect("checked");
+                    continue;
+                }
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// TREE-WIDE: no production source anywhere in this crate may render an error
+    /// with the ALTERNATE form.
+    ///
+    /// The guard above covers this file and fully-qualified `tracing::` calls only.
+    /// This one covers every module, and deliberately bans a NARROWER set of specs
+    /// so it can: the alternate Display `{:#}` and the alternate Debug `{:#?}`,
+    /// in every spelling including inline capture, and NOT the plain debug `{:?}`.
+    ///
+    /// WHY THE DEBUG RENDER IS LEFT OUT, since a wider ban looks strictly safer:
+    /// `{:?}` on a `Path` or a `PathBuf` is the idiomatic way to print one, and
+    /// `session.rs` alone has about ten such sites -- all benign. Banning it
+    /// tree-wide would red on all of them, and the obvious repair, listing them as
+    /// exemptions, would add ten waiver rows and dilute the guard toward the
+    /// documented-exemption failure this codebase has logged before. The debug ban
+    /// therefore stays local to the file whose sites are all error renders. The
+    /// alternate forms have no such benign use: `{:#x}`, `{:#b}` and `{:#o}` end in
+    /// different closing forms and are unaffected.
+    ///
+    /// ALTERNATE DEBUG IS INCLUDED even though it is half a debug render, because
+    /// `:#?}` contains neither of the other closing forms as a substring, so
+    /// leaving it out would reopen exactly the evasion this predicate was widened
+    /// to close -- for no benefit, there being zero uses of it anywhere.
+    ///
+    /// WHAT THIS DOES NOT CATCH, and the first item is the incident that motivated
+    /// the whole line of work, so read it before trusting this guard:
+    ///   * An alternate render performed in a `format!` whose result is then passed
+    ///     to a log macro. That is precisely how the endpoint reached the journal
+    ///     from `diagnose`. This check does catch it, because it scans production
+    ///     source rather than macro bodies -- but only because it is a TEXT scan of
+    ///     the whole region. Move the `format!` into a helper in a file this walk
+    ///     skips and it is invisible again.
+    ///   * A fill or align character before the flag (`{e:>#}`), which needs a real
+    ///     parse of the format spec rather than a substring match.
+    ///   * Tracing's `?field` Debug shorthand, which is not a format spec at all.
+    ///     Measured at the time of writing: zero such sites in production source.
+    ///   * Anything reached through a `Display` impl that itself renders a cause
+    ///     chain.
+    ///   * ANY SOURCE OUTSIDE THIS CRATE. The walk starts at `CARGO_MANIFEST_DIR`,
+    ///     so it covers this crate and nothing else. The eBPF daemon is a separate
+    ///     Cargo workspace in a sibling directory and is NOT walked -- and it does
+    ///     contain such a site, in its probe loader. Stated rather than left to be
+    ///     discovered, because "the tree-wide guard passes" will otherwise be read
+    ///     as "the repository is clean", and the repository is larger than the
+    ///     crate.
+    const ALTERNATE_SPECS: [&str; 2] = [":#}", ":#?}"];
+
+    fn has_alternate_render(line: &str) -> bool {
+        ALTERNATE_SPECS.iter().any(|spec| line.contains(spec))
+    }
+
+    #[test]
+    fn no_production_source_renders_an_error_with_the_alternate_form() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let files = rust_sources(&root);
+
+        // Assert the SETUP. Every assertion below is an ABSENCE check, and an
+        // absence check over an empty or truncated file list passes while proving
+        // nothing at all.
+        assert!(
+            files.len() >= 20,
+            "the source walk found only {} files under {}; an absence check over \
+             too few files is vacuous",
+            files.len(),
+            root.display()
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("main.rs")),
+            "the walk did not find main.rs, so it is not looking where it thinks"
+        );
+        let mut scanned_bytes = 0usize;
+
+        let mut findings = Vec::new();
+        for path in &files {
+            let raw = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            let region = strip_comments(&production_region(&raw));
+            scanned_bytes += region.len();
+            for (index, line) in region.lines().enumerate() {
+                if has_alternate_render(line) {
+                    let shown = path.strip_prefix(&root).unwrap_or(path);
+                    findings.push(format!("{}:{} {}", shown.display(), index + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            scanned_bytes > 100_000,
+            "only {scanned_bytes} bytes of production source were scanned; the cut \
+             or the stripper has eaten the corpus"
+        );
+
+        // PER-FILE ANCHORS, because the aggregate floor above CANNOT see one file
+        // collapsing. A review demonstrated exactly that: the corpus is ~900 KB,
+        // so losing 99% of the ES shipper AND 60% of session.rs still cleared both
+        // the file count and the byte floor comfortably. An aggregate assertion
+        // bounds total collapse and nothing finer, which is less than it looks.
+        //
+        // Each anchor is a production symbol deep in its file. If the region logic
+        // regresses, the anchor vanishes and names the file that went dark.
+        //
+        // WHAT EACH ONE ACTUALLY DISCRIMINATES, measured rather than assumed,
+        // because the first attempt at this list contained an anchor that proved
+        // nothing and I did not notice:
+        //   shipper.rs    catches the rejected cut-at-first-marker (that file was
+        //                 reduced to 0.7% by it)
+        //   session.rs    likewise -- but ONLY with a symbol past the test module.
+        //                 `Lutris` was the first choice and appears in a doc
+        //                 comment on line 4, so the BROKEN region contained it too
+        //                 and the anchor was satisfied by both versions.
+        //   handshake.rs  does NOT discriminate against that particular
+        //                 regression, because the old cut happened to be correct
+        //                 for this file. It is forward-looking: it guards against
+        //                 a FUTURE change that shortens this file's region.
+        //
+        // An anchor satisfied by both the fixed and the broken version is not a
+        // weak test, it is not a test.
+        for (file, anchor) in [
+            ("shipper.rs", "fn build_client"),
+            // `Lutris` was the first choice and it was BLIND: it appears in a
+            // doc comment at session.rs line 4, so the REJECTED implementation's
+            // output contained it too. An anchor that both the fixed and the
+            // broken version satisfy tests nothing. This symbol exists only past
+            // the test module, which is the region that was being lost.
+            ("session.rs", "LutrisGameConfig"),
+            ("handshake.rs", "fn endpoint_origin"),
+        ] {
+            let path = root.join(file);
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+            assert!(
+                raw.contains(anchor),
+                "anchor `{anchor}` is no longer in {file}; update the anchor rather \
+                 than deleting it, or this check silently stops checking"
+            );
+            assert!(
+                production_region(&raw).contains(anchor),
+                "{file} is being scanned only up to some point BEFORE `{anchor}`, so \
+                 the tail of that file is unguarded while this test still passes"
+            );
+        }
+        assert!(
+            findings.is_empty(),
+            "production source renders an error with the alternate form, which \
+             prints every cause verbatim -- the mechanism by which a configured \
+             endpoint reached the journal. Render with `{{}}` and let the outermost \
+             context carry the message:\n{}",
+            findings.join("\n")
+        );
+    }
+
+    /// Replace every Rust comment with spaces, preserving newlines so line numbers
+    /// survive.
+    ///
+    /// Needed because the hazard this file guards against is DISCUSSED in prose all
+    /// over this codebase -- the non-test region of this very file names `{:#}` in
+    /// four comments -- so a scan that cannot tell code from commentary would fire
+    /// on the documentation of the rule it enforces.
+    ///
+    /// Tracks ordinary, raw, byte and C strings and char literals so comment
+    /// markers inside them cannot erase later production source.
+    fn strip_comments(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        let (mut in_str, mut escaped) = (false, false);
+        let mut block_depth = 0usize;
+        let mut in_line = false;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            let next = bytes.get(i + 1).map(|b| *b as char);
+            if in_line {
+                if c == '\n' {
+                    in_line = false;
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+                continue;
+            }
+            if block_depth > 0 {
+                if c == '/' && next == Some('*') {
+                    block_depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                if c == '*' && next == Some('/') {
+                    block_depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                out.push(if c == '\n' { '\n' } else { ' ' });
+                i += 1;
+                continue;
+            }
+            if in_str {
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == '/' && next == Some('/') {
+                in_line = true;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                block_depth = 1;
+                out.push_str("  ");
+                i += 2;
+                continue;
+            }
+            if matches!(c, 'r' | 'b' | 'c') {
+                if let Some(end) = raw_string_end(src, i) {
+                    out.push_str(&src[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
+            if matches!(c, '\'' | 'b') {
+                if let Some(end) = char_literal_end(src, i) {
+                    out.push_str(&src[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    /// `production_region` against the two real shapes that broke its predecessor.
+    ///
+    /// Its first implementation cut the file at the first line-anchored
+    /// `#[cfg(test)]`, which is wrong twice over in this crate, and neither case
+    /// was hypothetical -- a review measured both. Only `strip_comments` had a
+    /// test; this function did not, and that is why the defect shipped to review.
+    #[test]
+    fn production_region_removes_test_modules_and_nothing_else() {
+        // SHAPE 1: a `#[cfg(test)]` single item BEFORE the real test module. The
+        // old cut landed on the import and dropped the rest of the file --
+        // measured at 99.3% of the ES shipper.
+        let shape_one = concat!(
+            "use std::io;\n",
+            "#[cfg(test)]\n",
+            "use std::collections::HashSet;\n",
+            "fn production_one() { let _ = \"KEEP_ONE\"; }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn helper() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+        );
+        let region = production_region(shape_one);
+        assert!(
+            region.contains("KEEP_ONE"),
+            "production code dropped: {region}"
+        );
+        assert!(
+            region.contains("HashSet"),
+            "a cfg(test) single item has no block and must not cut the file: {region}"
+        );
+        assert!(
+            !region.contains("DROP_ME"),
+            "test module survived: {region}"
+        );
+
+        // SHAPE 2: production code AFTER the test module. session.rs does this
+        // deliberately and says so in an allow attribute.
+        let shape_two = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn helper() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_two() { let _ = \"KEEP_TWO\"; }\n",
+        );
+        let region = production_region(shape_two);
+        assert!(
+            region.contains("KEEP_TWO"),
+            "code after the test module was dropped: {region}"
+        );
+        assert!(
+            !region.contains("DROP_ME"),
+            "test module survived: {region}"
+        );
+
+        // A brace inside a string or a comment must not end the block early.
+        let tricky = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn a() { let _ = \"}\"; }\n",
+            "    // }\n",
+            "    fn b() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_three() { let _ = \"KEEP_THREE\"; }\n",
+        );
+        let region = production_region(tricky);
+        assert!(
+            !region.contains("DROP_ME"),
+            "brace-matching ended early: {region}"
+        );
+        assert!(region.contains("KEEP_THREE"), "tail dropped: {region}");
+
+        // A BLOCK COMMENT containing a brace, and a NESTED one. `matching_brace`
+        // tracked block comments with a bool until a review pointed out that Rust
+        // nests them and that its sibling `strip_comments` already counted depth.
+        let blocks = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    /* } */\n",
+            "    /* outer /* inner } */ still outer } */\n",
+            "    fn a() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_four() { let _ = \"KEEP_FOUR\"; }\n",
+        );
+        let region = production_region(blocks);
+        assert!(
+            !region.contains("DROP_ME"),
+            "block comments ended the block early: {region}"
+        );
+        assert!(region.contains("KEEP_FOUR"), "tail dropped: {region}");
+
+        // A CHAR LITERAL holding a brace.
+        let chars = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    const C: char = '}';\n",
+            "    fn a() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_five() { let _ = \"KEEP_FIVE\"; }\n",
+        );
+        let region = production_region(chars);
+        assert!(
+            !region.contains("DROP_ME"),
+            "a char literal ended the block early: {region}"
+        );
+        assert!(region.contains("KEEP_FIVE"), "tail dropped: {region}");
+
+        // RAW STRINGS. A backslash inside one is not an escape, and the corpus
+        // really contains `r#"..."#` fixtures -- config.rs holds several.
+        let raws = concat!(
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    const A: &str = r\"trailing backslash \\\";\n",
+            "    const B: &str = r#\"has \"quotes\" and a } brace\"#;\n",
+            "    const C: &[u8] = br#\"quoted \" } byte raw\"#;\n",
+            "    const D: &std::ffi::CStr = cr#\"quoted \" } C raw\"#;\n",
+            "    fn a() { let _ = \"DROP_ME\"; }\n",
+            "}\n",
+            "fn production_six() { let _ = \"KEEP_SIX\"; }\n",
+        );
+        let region = production_region(raws);
+        assert!(
+            !region.contains("DROP_ME"),
+            "a raw string desynced the scan: {region}"
+        );
+        assert!(region.contains("KEEP_SIX"), "tail dropped: {region}");
+
+        // Line numbers must survive for EVERY fixture, not just the first --
+        // asserting it once was flagged in review as covering less than it looked.
+        for (name, fixture) in [
+            ("shape_one", shape_one),
+            ("shape_two", shape_two),
+            ("tricky", tricky),
+            ("blocks", blocks),
+            ("chars", chars),
+            ("raws", raws),
+        ] {
+            assert_eq!(
+                production_region(fixture).matches('\n').count(),
+                fixture.matches('\n').count(),
+                "{name}: line count changed, so reported line numbers would be wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn the_comment_stripper_keeps_strings_and_drops_prose() {
+        let src = concat!(
+            "let a = \"keeps // this\";\n",
+            "// drops {:#} this\n",
+            "let b = \"keeps /* this */ too\";\n",
+            "/* drops\n   {e:#} across lines */\n",
+            "let c = '\"';\n",
+            "let d = \"tail {x:#}\";\n",
+        );
+        let out = strip_comments(src);
+        assert!(
+            out.contains("keeps // this"),
+            "string content was stripped: {out}"
+        );
+        assert!(
+            out.contains("keeps /* this */ too"),
+            "string content was stripped: {out}"
+        );
+        assert!(
+            out.contains("tail {x:#}"),
+            "a real hazard in a string was stripped: {out}"
+        );
+        assert!(
+            !out.contains("drops {:#} this"),
+            "line comment survived: {out}"
+        );
+        assert!(!out.contains("{e:#}"), "block comment survived: {out}");
+        assert_eq!(
+            out.matches('\n').count(),
+            src.matches('\n').count(),
+            "line count changed, so reported line numbers would be wrong"
+        );
+    }
+
+    /// Exercise the same preprocessing and line predicate as the tree-wide guard.
+    /// Both observations matter: a missing line makes the verdict vacuously safe.
+    fn assert_production_render_is_guarded(source: &str) {
+        let render = "format!(\"{e:#}\")";
+        assert!(source.lines().any(|line| line.trim() == render));
+        let preprocessed = strip_comments(&production_region(source));
+        let retained = preprocessed.lines().any(|line| line.trim() == render);
+        let flagged = preprocessed.lines().any(has_alternate_render);
+        assert_eq!(
+            (retained, flagged),
+            (true, true),
+            "production render must survive preprocessing and trigger the guard:\n{preprocessed}"
+        );
+    }
+
+    #[test]
+    fn out_of_line_cfg_test_module_does_not_hide_following_production_render() {
+        let source = concat!(
+            "#[cfg(test)]\n",
+            "mod review_empty;\n",
+            "fn review_render(e: &anyhow::Error) -> String {\n",
+            "    format!(\"{e:#}\")\n",
+            "}\n",
+        );
+        assert_production_render_is_guarded(source);
+    }
+
+    #[test]
+    fn raw_string_comment_text_does_not_hide_following_production_render() {
+        let source = concat!(
+            "fn review_render(e: &anyhow::Error) -> String {\n",
+            "    let _ = r#\"quoted \" /* ordinary raw-string contents\"#;\n",
+            "    format!(\"{e:#}\")\n",
+            "}\n",
+        );
+        assert_production_render_is_guarded(source);
+    }
+
+    #[test]
+    fn raw_c_string_comment_text_does_not_hide_following_production_render() {
+        let source = concat!(
+            "fn review_render(e: &anyhow::Error) -> String {\n",
+            "    let _ = cr#\"quoted \" /* ordinary C-string contents\"#;\n",
+            "    format!(\"{e:#}\")\n",
+            "}\n",
+        );
+        assert_production_render_is_guarded(source);
     }
 
     /// The PREDICATE, against synthetic strings rather than today's corpus.
@@ -2538,6 +3264,17 @@ mod tests {
             rendered,
             "flushing spool writer: No space left on device (os error 28)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn error_for_log_escapes_a_forged_line_in_the_outer_spool_path() {
+        let err = anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EACCES))
+            .context("opening active spool file: /tmp/spool\nWARN rigsignal: FORGED.ndjson");
+        let rendered = error_for_log(&err);
+        assert!(!rendered.contains('\n'), "{rendered:?}");
+        assert!(rendered.contains("spool\\nWARN rigsignal: FORGED.ndjson"));
+        assert!(rendered.contains("Permission denied (os error 13)"));
     }
 
     /// An OS error nested deeper than the first cause is still found: the helper
