@@ -150,10 +150,8 @@ jobs:
                "tag leak $tag_leak_rc / clean $tag_clean_rc"
 
       - name: Lint commit messages introduced by this change
-        # A tag push can add an annotation while adding no commits. Its own
-        # message is handled by the independent tag step below.
-        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
         env:
+          REF: ${{ github.ref }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -171,6 +169,20 @@ jobs:
               base="$before"
             fi
           fi
+
+          # A tag push adds no branch commits when the tagged commit is already
+          # in main: those messages were linted when main was pushed, and the
+          # tag's OWN message is linted by the separate tag step below. Only
+          # that case is exempt. A tag on a commit outside main still has
+          # merge-base..HEAD scanned here, because nothing else would scan it.
+          case "$REF" in
+            refs/tags/*)
+              if [ "$base" = "$HEAD" ] && git merge-base --is-ancestor "$HEAD" origin/main; then
+                echo "public_text_lint: $REF points at a commit already in main; no new commits."
+                exit 0
+              fi
+              ;;
+          esac
 
           # FAIL LOUD ON AN UNDETERMINABLE RANGE rather than compute a vacuous one.
           #

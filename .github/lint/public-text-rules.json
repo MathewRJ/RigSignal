@@ -126,6 +126,11 @@
         "id": "decimal-hex-octal-ipv4",
         "arises": "mostly by intent",
         "note": "The accidental route is pasting raw output from a tool that renders addresses as integers. Real but narrow for this project's toolchain. Lowest priority."
+      },
+      {
+        "id": "cidr-class-names",
+        "arises": "by accident",
+        "note": "Prose that names the unique-local or link-local block in CIDR notation (the block's first address followed by a prefix length) is refused as a private-ipv6 finding, because the first address of each block is itself a member of that block. Rewrite the prose in words. NOT handled: exempting a trailing prefix length would also exempt a real address written with one."
       }
     ]
   }
