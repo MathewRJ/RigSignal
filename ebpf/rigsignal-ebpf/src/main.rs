@@ -111,7 +111,14 @@ async fn main() -> Result<()> {
 
     info!("RigSignal eBPF daemon starting");
     info!("BPF probe path: {}", probe_path.display());
-    info!("ES endpoint: {}", config.elasticsearch.endpoint);
+    // The raw endpoint is an unvalidated bare String that may carry a credential
+    // in userinfo or in a query parameter, and this line fires on EVERY start --
+    // it needs no failure, unlike the agent's startup preflight. Reduced to a bare
+    // origin, or withheld whole.
+    info!(
+        "ES endpoint: {}",
+        config::endpoint_for_log(&config.elasticsearch.endpoint)
+    );
 
     // Host metadata (filled once at startup)
     let host_name = normalize_hostname(
