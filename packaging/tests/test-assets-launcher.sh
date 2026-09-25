@@ -237,9 +237,44 @@ require_missing_match "$tmp/fake-etc/rigsignal" '.rigsignal.toml.*' "privileged 
 require_missing_match "$home/.config/rigsignal" '.rigsignal.toml.assets.*' "user Kibana transaction temporary file survived rollback"
 require_missing_match "$home/.config/rigsignal" '.rigsignal-system.*' "user system-sync temporary file survived rollback"
 
-run_status run_noninteractive --repair --upgrade --allow-downgrade >"$tmp/flags.out" 2>&1
+run_status run_noninteractive --repair --upgrade --allow-downgrade --allow-untested-stack-version >"$tmp/flags.out" 2>&1
 require_status 0 "$RUN_STATUS" "transition flag invocation"
+require_line --allow-untested-stack-version "$args" "untested-stack flag missing"
 require_line --repair "$args" "repair flag missing"; require_line --upgrade "$args" "upgrade flag missing"; require_line --allow-downgrade "$args" "allow-downgrade flag missing"
+
+# Pass through the actual engine ArgumentParser, with only offline bundle
+# loading replaced. Dry-run cannot issue a transport request.
+cat >"$engine/install_assets.py" <<'PYVERSION'
+import importlib.util
+import os
+import sys
+from unittest.mock import patch
+spec = importlib.util.spec_from_file_location("real_version_engine", os.environ["VERSION_TEST_ENGINE"])
+engine = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(engine)
+parse = engine.argparse.ArgumentParser.parse_args
+def record(self, *args, **kwargs):
+    value = parse(self, *args, **kwargs)
+    print("parsed-untested=" + str(value.allow_untested_stack_version))
+    return value
+sys.argv.append("--dry-run")
+with patch.object(engine.argparse.ArgumentParser, "parse_args", record), \
+     patch.object(engine, "load_bundle", return_value=engine.Bundle("test", "test", [])), \
+     patch.object(engine, "role_body", return_value={}):
+    raise SystemExit(engine.main())
+PYVERSION
+for expected in False True; do
+    extra=()
+    if [ "$expected" = True ]; then extra=(--allow-untested-stack-version); fi
+    run_status env HOME="$home" XDG_CONFIG_HOME="$home/.config" TMPDIR="$tmp/runtime" \
+        PYTHONDONTWRITEBYTECODE=1 VERSION_TEST_ENGINE="$repo/tools/install_assets.py" \
+        ASSETS_ALLOW_UNTESTED_STACK_VERSION=1 \
+        "$bin/rigsignal" assets install --bundle "$bundle" --endpoint https://es.example.invalid \
+        --ca-file "$ca" --kibana-endpoint https://kibana.example.invalid \
+        --admin-credentials-file "$credentials" --non-interactive "${extra[@]}" >"$tmp/real-parser-$expected.out" 2>&1
+    require_status 0 "$RUN_STATUS" "actual engine parser status"
+    require_line "parsed-untested=$expected" "$tmp/real-parser-$expected.out" "actual engine explicit flag parsing"
+done
 
 printf '%s\n' '#!/usr/bin/env python3' 'import sys' 'print("engine fixture stderr", file=sys.stderr)' 'raise SystemExit(2)' >"$engine/install_assets.py"
 set +e; printf 'failure-admin-marker\nfailure-password-marker\n' | HOME="$home" XDG_CONFIG_HOME="$home/.config" TMPDIR="$tmp/runtime" RIGSIGNAL_ASSETS_TEST_ARGS="$args" RIGSIGNAL_ASSETS_TEST_CREDENTIAL="$credential_probe" "$bin/rigsignal" assets install --bundle "$bundle" --endpoint http://127.0.0.1:9200 --ca-file "$ca" --kibana-endpoint https://kibana.example.invalid >"$tmp/status.out" 2>&1; RUN_STATUS=$?; set -e

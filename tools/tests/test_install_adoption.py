@@ -18,6 +18,9 @@ SPEC.loader.exec_module(INSTALL)
 
 class InstallAdoptionTests(unittest.TestCase):
     def setUp(self):
+        gate = patch.object(INSTALL, "stack_version_preflight")
+        gate.start()
+        self.addCleanup(gate.stop)
         # main() deliberately uses the production boundary of /.  These
         # integration tests are about adoption, not host namespace ownership.
         self.ancestor_check = patch.object(INSTALL, "check_install_root_ancestors")
@@ -531,6 +534,12 @@ if __name__ == "__main__":
 
 
 class RollbackBoundaryFenceTests(unittest.TestCase):
+    def setUp(self):
+        # Version transport has dedicated real-entrypoint coverage.
+        gate = patch.object(INSTALL, "stack_version_preflight")
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_rollback_invocation_fences_remote_table_version(self):
         # S1-v4: rollback is an invocation boundary; a remote marker carrying a
         # different ownership_table_version must refuse before any reversal.

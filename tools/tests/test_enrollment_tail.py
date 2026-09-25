@@ -459,6 +459,12 @@ class PublicationProbeMatrixTests(unittest.TestCase):
 
 
 class FailureSiteTests(unittest.TestCase):
+    def setUp(self):
+        # Version transport has dedicated real-entrypoint coverage.
+        gate = patch.object(INSTALL, "stack_version_preflight")
+        gate.start()
+        self.addCleanup(gate.stop)
+
     @staticmethod
     def args(root: Path) -> SimpleNamespace:
         return SimpleNamespace(
@@ -676,6 +682,12 @@ class FailureSiteTests(unittest.TestCase):
 
 
 class MainPreflightRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        # Version transport has dedicated real-entrypoint coverage.
+        gate = patch.object(INSTALL, "stack_version_preflight")
+        gate.start()
+        self.addCleanup(gate.stop)
+
     @staticmethod
     def args(root: Path, *, rollback: Path | None = None) -> SimpleNamespace:
         return SimpleNamespace(

@@ -5511,14 +5511,15 @@ def assets_only_install(bundle: Bundle, es_url: str, kb_url: str, authorization:
                         marker_path: Path | None = None, *, repair: bool = False,
                         upgrade: bool = False, allow_downgrade: bool = False,
                         archive_sha256: str | None = None,
-                        unsafe_test_injection: bool = False) -> str:
+                        unsafe_test_injection: bool = False,
+                        allow_untested_stack_version: bool = False) -> str:
     """Run the shared v2 default asset transaction for the assets-only caller."""
     marker_path = marker_path or _prepare_assets_marker_path(None, bundle)
     # All default-profile callers, including in-memory test callers, enter
     # the same v2 state machine.  An in-memory bundle has a deterministic
     # content digest; release CLI calls replace it with the protected archive
     # snapshot digest.
-    prerequisites(es_url, kb_url, authorization)
+    prerequisites(es_url, kb_url, authorization, allow_untested=allow_untested_stack_version)
     binding = transaction_binding(bundle, cluster_uuid(es_url, authorization), kb_url,
                                   archive_sha256 or bundle_snapshot_digest(bundle))
     return run_default_asset_transaction(bundle, es_url, kb_url, authorization, marker_path,
@@ -5871,14 +5872,57 @@ def cluster_uuid(es_url: str, authorization: str) -> str:
     return value
 
 
-def prerequisites(es_url: str, kb_url: str, authorization: str) -> None:
+# Bound the complete value before regex matching or integer conversion. Core
+# tokens are consequently at most 124 digits (well below Python's int limit).
+STACK_VERSION_MAX_LENGTH = 128
+STACK_SUPPORTED_RANGE = ("supported range: >=9.4.3 <9.5.0; "
+                         "Elasticsearch and Kibana major.minor must match")
+STACK_VERSION_RE = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", re.ASCII)
+
+
+class StackVersionRefusal(ProvisionError):
+    """Fixed public eligibility diagnostic, including on uncertain transactions."""
+
+
+def stack_version(response: object) -> tuple[int, int, int]:
+    version = response.get("version") if isinstance(response, dict) else None
+    value = version.get("number") if isinstance(version, dict) else None
+    if not isinstance(value, str) or not 1 <= len(value) <= STACK_VERSION_MAX_LENGTH:
+        raise StackVersionRefusal("install refused: stack version; " + STACK_SUPPORTED_RANGE)
+    match = STACK_VERSION_RE.fullmatch(value)
+    if match is None:
+        raise StackVersionRefusal("install refused: stack version; " + STACK_SUPPORTED_RANGE)
+    return tuple(int(part) for part in match.groups())
+
+
+def stack_version_preflight(es_url: str, kb_url: str, authorization: str, *,
+                            allow_untested: bool = False) -> None:
+    """Read-only eligibility boundary; metadata never enters diagnostics."""
     try:
-        es = es_json(es_url, "/", "GET", authorization)
-        kb = es_json(kb_url, "/api/status", "GET", authorization)
-        es_version = es.get("version", {}).get("number") if isinstance(es, dict) else None
-        kb_version = kb.get("version", {}).get("number") if isinstance(kb, dict) else None
-        if es_version not in {"9.4.3", "9.4.4"} or kb_version != es_version:
-            raise InputError("unsupported Elasticsearch/Kibana version pair")
+        es = stack_version(es_json(es_url, "/", "GET", authorization))
+        kb = stack_version(es_json(kb_url, "/api/status", "GET", authorization))
+    except (RequestFailure, InputError) as error:
+        raise ProvisionError("install failed: prerequisite:") from error
+    eligible = (es[0] == kb[0] == 9 and es[:2] == kb[:2]
+                and es >= (9, 4, 3) and kb >= (9, 4, 3))
+    supported = eligible and es[:2] == (9, 4)
+    if not eligible or (not supported and not allow_untested):
+        guidance = ("; use --allow-untested-stack-version for this untested pair"
+                    if eligible else "")
+        raise StackVersionRefusal("install refused: stack version; " + STACK_SUPPORTED_RANGE + guidance)
+    if not supported:
+        print("warning: --allow-untested-stack-version accepted an untested stack: "
+              "Elasticsearch " + ".".join(map(str, es)) + "; Kibana " + ".".join(map(str, kb))
+              + "; " + STACK_SUPPORTED_RANGE, file=sys.stderr)
+
+
+def prerequisites(es_url: str, kb_url: str, authorization: str, *,
+                  allow_untested: bool = False, versions_checked: bool = False) -> None:
+    if not versions_checked:
+        stack_version_preflight(es_url, kb_url, authorization, allow_untested=allow_untested)
+    try:
         deadline = time.monotonic() + 60
         required = ("logs@mappings", "logs@settings", "ecs@mappings")
         while True:
@@ -7099,6 +7143,8 @@ def main() -> int:
                         help="install bundle assets without creating an enrollment root")
     parser.add_argument("--assets-marker", type=Path, metavar="MARKER",
                         help="protected local ownership marker for --assets-only")
+    parser.add_argument("--allow-untested-stack-version", action="store_true",
+                        help="allow untested stable 9.x pairs above the supported floor with matching major.minor")
     parser.add_argument("--repair", action="store_true", help="re-apply proven-owned assets")
     parser.add_argument("--upgrade", action="store_true", help="re-apply proven-owned assets")
     parser.add_argument("--allow-downgrade", action="store_true",
@@ -7178,6 +7224,8 @@ def main() -> int:
                     raise ProvisionError("install refused: transaction_journal_invalid") from error
                 if isinstance(recorded, dict) and recorded.get("ownership_profile") in {"default", "fleet-coexist"}:
                     requested_profile = recorded["ownership_profile"]
+            stack_version_preflight(es_url, kb_url, authorization,
+                                    allow_untested=getattr(args, "allow_untested_stack_version", False))
             fence_remote_ownership_profile(es_url, authorization, requested_profile, False)
             operations = rollback_transaction(es_url, kb_url, authorization, rollback_root,
                                              deliberately_reversed=True, bundle_path=args.bundle)
@@ -7212,6 +7260,8 @@ def main() -> int:
     except ProvisionError as error:
         boundary_status = transaction_boundary_failure(boundary_marker_path, -1)
         if boundary_status != -1:
+            if isinstance(error, StackVersionRefusal):
+                print(error.prefix, file=sys.stderr)
             return boundary_status
         return finalize_failure(error.prefix, failure_tracker, mutation_tracker,
                                 local=is_local_failure_message(error.prefix))
@@ -7293,7 +7343,8 @@ def main() -> int:
                                           upgrade=getattr(args, "upgrade", False),
                                           allow_downgrade=getattr(args, "allow_downgrade", False),
                                           archive_sha256=(bundle_archive_sha256 if args.bundle.is_file() else None),
-                                          unsafe_test_injection=args.unsafe_test_injection)
+                                          unsafe_test_injection=args.unsafe_test_injection,
+                                          allow_untested_stack_version=getattr(args, "allow_untested_stack_version", False))
             print("assets-only " + outcome)
             return asset_executor_exit_code("success", marker_path)
         except (AssetTransactionHalt, AssetTransactionRefusal):
@@ -7305,9 +7356,13 @@ def main() -> int:
         except ProvisionError as error:
             boundary_status = transaction_boundary_failure(boundary_marker_path, -1)
             if boundary_status != -1:
+                if isinstance(error, StackVersionRefusal):
+                    print(error.prefix, file=sys.stderr)
                 return boundary_status
             status = (asset_executor_exit_code("refusal", marker_path)
                       if "marker_path" in locals() else 3)
+            if status == 4 and isinstance(error, StackVersionRefusal):
+                print(error.prefix, file=sys.stderr)
             return 4 if status == 4 else finalize_failure(error.prefix, failure_tracker, mutation_tracker,
                                                            local=is_local_failure_message(error.prefix))
         except (InputError, RequestFailure, OSError) as error:
@@ -7381,6 +7436,10 @@ def main() -> int:
             # API keys may still parse for dry-run/read-only tooling, but this
             # invocation will mint a descriptor-bearing shipper key.
             raise ProvisionError("install refused: admin_credential_api_key")
+        # Authenticated eligibility and any override warning precede all
+        # recovery mutations, including revocation of unfinished candidates.
+        stack_version_preflight(es_url, kb_url, authorization,
+                                allow_untested=getattr(args, "allow_untested_stack_version", False))
         needs_default_marker = ownership_profile == "default" and bool(bundle.assets)
         # Incomplete enrollment is the sole ordering exception: its pending
         # credential must be recovered or invalidated before a new local
@@ -7488,7 +7547,7 @@ def main() -> int:
                                    published_recovery["enrollment_root"])
             atomic_write(root, "state.json", jcs(prior) + b"\n")
         failure_tracker.mark(FailureSite.ASSET_APPLY)
-        prerequisites(es_url, kb_url, authorization)  # Step 3
+        prerequisites(es_url, kb_url, authorization, versions_checked=True)  # Step 3
         cluster_health_gate(es_url, authorization)  # protocol invariant, all profiles
         fence(es_url, authorization, prior, uuid_value, root, adoption, bundle)  # Step 4, before W1 PUT
         pre_put_condition, pre_put_snapshot = remote_stream_condition(es_url, authorization, bundle)
@@ -7842,6 +7901,8 @@ def main() -> int:
     except ProvisionError as error:
         boundary_status = transaction_boundary_failure(boundary_marker_path, -1)
         if boundary_status != -1:
+            if isinstance(error, StackVersionRefusal):
+                print(error.prefix, file=sys.stderr)
             return boundary_status
         return finalize_failure(error.prefix, failure_tracker, mutation_tracker,
                                 local=is_local_failure_message(error.prefix))

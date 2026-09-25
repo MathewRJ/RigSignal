@@ -131,6 +131,12 @@ class AssetTransport:
 
 
 class AssetsOnlyInstallTests(unittest.TestCase):
+    def setUp(self):
+        # Version transport has dedicated real-entrypoint coverage.
+        gate = mock.patch.object(INSTALL, "stack_version_preflight")
+        gate.start()
+        self.addCleanup(gate.stop)
+
     @classmethod
     def setUpClass(cls):
         cls.bundle = INSTALL.load_source()
