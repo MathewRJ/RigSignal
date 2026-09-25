@@ -1057,6 +1057,7 @@ PY
         _err "$*"; exit 2
     }
     _assets_refuse() { _err "$*"; exit 3; }
+    ASSETS_ALLOW_UNTESTED_STACK_VERSION=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --bundle|--endpoint|--ca-file|--ca-sha256|--kibana-endpoint|--admin-credentials-file|--ownership-profile)
@@ -1073,8 +1074,9 @@ PY
             --repair) ASSETS_REPAIR=1; shift ;;
             --upgrade) ASSETS_UPGRADE=1; shift ;;
             --allow-downgrade) ASSETS_ALLOW_DOWNGRADE=1; shift ;;
+            --allow-untested-stack-version) ASSETS_ALLOW_UNTESTED_STACK_VERSION=1; shift ;;
             --non-interactive|--noninteractive) ASSETS_NONINTERACTIVE=1; shift ;;
-            *) _assets_die "Usage: rigsignal assets install [--bundle PATH] [--endpoint URL] [--ca-file PATH --ca-sha256 HEX] [--kibana-endpoint URL] [--admin-credentials-file PATH] [--non-interactive]" ;;
+            *) _assets_die "Usage: rigsignal assets install [--bundle PATH] [--endpoint URL] [--ca-file PATH --ca-sha256 HEX] [--kibana-endpoint URL] [--admin-credentials-file PATH] [--non-interactive] [--allow-untested-stack-version]" ;;
         esac
     done
     [ -z "$ASSETS_CA_SHA256" ] || { case "$ASSETS_CA_SHA256" in *[!0123456789abcdefABCDEF]*|'') _assets_die "assets install: --ca-sha256 must be 64 hexadecimal characters";; esac; [ "${#ASSETS_CA_SHA256}" -eq 64 ] || _assets_die "assets install: --ca-sha256 must be 64 hexadecimal characters"; }
@@ -1149,6 +1151,7 @@ PY
     if [ "$ASSETS_REPAIR" = 1 ]; then set -- --repair; else set --; fi
     [ "$ASSETS_UPGRADE" = 0 ] || set -- "$@" --upgrade
     [ "$ASSETS_ALLOW_DOWNGRADE" = 0 ] || set -- "$@" --allow-downgrade
+    [ "$ASSETS_ALLOW_UNTESTED_STACK_VERSION" = 0 ] || set -- "$@" --allow-untested-stack-version
     # On a signal the cancellation handler owns reaping and exits; this
     # ordinary wait path is only resumed when no cancellation was handled.
     set +e
